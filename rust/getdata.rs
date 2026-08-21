@@ -192,10 +192,8 @@ fn read_var_column(
 }
 
 fn utf16_native(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
-        .collect();
+    let (pairs, _remainder) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().map(|c| u16::from_ne_bytes(*c)).collect();
     String::from_utf16_lossy(&units)
 }
 
