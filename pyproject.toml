@@ -33,5 +33,12 @@ classifiers=['Development Status :: 5 - Production/Stable',
 Homepage = "https://github.com/mkleehammer/pyodbc"
 
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+# The Rust core (rust/ + Cargo.toml) is the module being built; the C++ sources in
+# src/ remain in the tree for reference during the rewrite and can still be built
+# directly with "python setup.py build_ext --inplace".
+[tool.maturin]
+python-source = "python"
+module-name = "pyodbc._core"

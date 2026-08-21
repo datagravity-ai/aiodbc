@@ -9,6 +9,11 @@ jobs:
     # https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
     runs-on: ubuntu-22.04
 
+    env:
+      # Make tests/conftest.py pick up the C++ extension from build/ (pyodbc itself
+      # is not pip-installed in this job; see "Build pyodbc" below).
+      PYODBC_TESTLOCAL: "1"
+
     strategy:
       fail-fast: false
       matrix:
@@ -185,17 +190,22 @@ jobs:
         echo "*** pip freeze"
         python -m pip freeze --all
 
-    - name: Build and install pyodbc
+    - name: Build pyodbc (C++ reference implementation)
+      # While the Rust rewrite is in progress (docs/rust-asyncio-rewrite-plan.md),
+      # "pip install ." builds the Rust core via maturin.  This job keeps testing the
+      # C++ reference implementation, built directly with setuptools and picked up
+      # from build/ by tests/conftest.py via PYODBC_TESTLOCAL.  The Rust core is
+      # built and tested by the "Rust core" workflow.
       run: |
         cd "$GITHUB_WORKSPACE"
         echo "*** current python version"
         python -VV
-        echo "*** pip install pyodbc"
-        CPPFLAGS=-UNDEBUG python -m pip install --verbose .
+        echo "*** pip install setuptools"
+        python -m pip install setuptools
+        echo "*** build the C++ extension"
+        CPPFLAGS=-UNDEBUG python setup.py build
         echo "*** pyodbc version"
-        python -c "import pyodbc; print(pyodbc.version)"
-        echo "*** pyodbc drivers"
-        python -c "import pyodbc; print('\n'.join(sorted(pyodbc.drivers())))"
+        python -c "import glob, sys; sys.path.insert(0, glob.glob('build/lib.*')[0]); import pyodbc; print(pyodbc.version)"
 
     - name: Run PostgreSQL tests
       env:
