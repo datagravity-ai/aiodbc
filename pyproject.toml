@@ -1,6 +1,6 @@
 [project]
 name = "pyodbc"
-version = "5.4.0"
+version = "6.0.0a1"
 
 requires-python = ">=3.10"
 # This is used by the GitHub action that builds release artifacts using cibuildwheel.
@@ -41,9 +41,8 @@ asyncio_mode = "auto"
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
-# The Rust core (rust/ + Cargo.toml) is the module being built; the C++ sources in
-# src/ remain in the tree for reference during the rewrite and can still be built
-# directly with "python setup.py build_ext --inplace".
+# The Rust core (rust/ + Cargo.toml) is the compiled module; python/pyodbc/ is the
+# pure-Python package layered on top of it.
 [tool.maturin]
 python-source = "python"
 module-name = "pyodbc._core"

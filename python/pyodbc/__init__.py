@@ -1,9 +1,8 @@
 """
 pyodbc - an asyncio-native DB API 2.0 module for ODBC, implemented in Rust.
 
-This package is being ported from the C++ implementation in src/ per
-docs/rust-asyncio-rewrite-plan.md.  The compiled Rust core is pyodbc._core; this
-module assembles the public API on top of it.
+The compiled Rust core is pyodbc._core; this module assembles the public API on
+top of it.  See docs/rust-asyncio-rewrite-plan.md for the design.
 """
 
 import datetime as _datetime

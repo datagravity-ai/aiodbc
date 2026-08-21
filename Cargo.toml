@@ -2,7 +2,7 @@
 name = "pyodbc"
 # The canonical version is in pyproject.toml (see CLAUDE.md); maturin uses that
 # for wheel metadata.  This one is not surfaced anywhere.
-version = "5.4.0"
+version = "6.0.0-a1"
 edition = "2021"
 publish = false
 
