@@ -4,7 +4,7 @@
 // return asyncio futures; a few sync properties (autocommit, timeout) dispatch to
 // the worker and block briefly.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -38,6 +38,7 @@ pub struct Connection {
     closed: bool,
     autocommit_flag: Arc<AtomicBool>,
     timeout_cache: Arc<AtomicU32>,
+    readvar_initsize: Arc<AtomicUsize>,
 }
 
 impl Connection {
@@ -133,6 +134,26 @@ impl Connection {
         self.closed
     }
 
+    /// Initial buffer size in bytes for reading variable-length columns; 0 means
+    /// size the buffer from the column descriptor.  Stored only - it is consulted
+    /// on the worker at fetch time, so the setter needs no ODBC round-trip.
+    #[getter]
+    fn readvar_initsize(&self) -> usize {
+        self.readvar_initsize.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_readvar_initsize(&self, value: i64) -> PyResult<()> {
+        if value < 0 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Cannot set readvar_initsize to a negative value.",
+            ));
+        }
+        self.readvar_initsize
+            .store(value as usize, Ordering::Relaxed);
+        Ok(())
+    }
+
     #[getter]
     fn timeout(&self) -> u32 {
         self.timeout_cache.load(Ordering::Relaxed)
@@ -171,7 +192,11 @@ impl Connection {
     fn cursor(slf: &Bound<'_, Self>) -> PyResult<Cursor> {
         let this = slf.borrow();
         let tx = this.channel()?.clone();
-        Ok(Cursor::new(tx, slf.clone().unbind()))
+        Ok(Cursor::new(
+            tx,
+            slf.clone().unbind(),
+            this.readvar_initsize.clone(),
+        ))
     }
 
     /// Convenience: create a cursor and execute on it.  Returns a future resolving
@@ -404,6 +429,7 @@ pub fn connect(
             closed: false,
             autocommit_flag,
             timeout_cache: Arc::new(AtomicU32::new(0)),
+            readvar_initsize: Arc::new(AtomicUsize::new(4096)),
         },
     )?;
     let conn_result: Py<PyAny> = conn.clone_ref(py).into_any();

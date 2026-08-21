@@ -173,6 +173,17 @@ jobs:
 
     - uses: actions/checkout@v4.3.0
 
+    - name: Pin the test suites to the C++ reference vintage
+      # The test suites were converted to asyncio idiom for the Rust port (Phase 2 of
+      # docs/rust-asyncio-rewrite-plan.md) and no longer run against the synchronous
+      # C++ implementation.  The C++ sources are frozen as the reference
+      # implementation, so this job tests them with the matching pre-conversion tests.
+      # This pin (and this whole job) goes away at cutover, when src/ is removed.
+      run: |
+        cd "$GITHUB_WORKSPACE"
+        git fetch --depth=1 origin c914671af1f43e7960ad6a1f2d486fb07aa6bce6
+        git checkout c914671af1f43e7960ad6a1f2d486fb07aa6bce6 -- tests/
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5.0.0
       with:

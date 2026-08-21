@@ -113,12 +113,13 @@ fn succeeded(ret: SqlReturn) -> bool {
 }
 
 /// Read a variable-length column via repeated SQLGetData calls.  A direct port of
-/// ReadVarColumn in getdata.cpp (with readvar_initsize fixed at its default, 4096,
-/// until the property is ported).  Returns None for SQL NULL.
+/// ReadVarColumn in getdata.cpp.  Returns None for SQL NULL.
 fn read_var_column(
     hstmt: HStmt,
     col: usize,
     ctype: CDataType,
+    column_size: u64,
+    initsize: usize,
     on_error: &impl Fn(&'static str) -> PyErr,
 ) -> PyResult<Option<Vec<u8>>> {
     let wide = ctype == CDataType::WChar;
@@ -126,7 +127,26 @@ fn read_var_column(
     let binary = ctype == CDataType::Binary;
     let cb_null_terminator: usize = if binary { 0 } else { cb_element };
 
-    let mut buf: Vec<u8> = vec![0; 4096];
+    // Initial allocation, following ReadVarColumn in getdata.cpp: an explicit
+    // readvar_initsize wins; 0 means size the buffer from the column descriptor so
+    // one SQLGetData call can return everything (some drivers loop forever on
+    // smaller buffers), clamped to a sane ceiling for absurd descriptor values.
+    let cb_allocated = if initsize == 0 {
+        const CEILING: usize = 32 * 1024 * 1024;
+        let from_column = (column_size as usize)
+            .saturating_mul(cb_element)
+            .saturating_add(cb_null_terminator);
+        if from_column == 0 || from_column > CEILING {
+            CEILING
+        } else {
+            from_column
+        }
+    } else {
+        // Never smaller than one element plus its terminator.
+        initsize.max(cb_element + cb_null_terminator)
+    };
+
+    let mut buf: Vec<u8> = vec![0; cb_allocated];
     let mut cb_used: usize = 0;
 
     loop {
@@ -166,12 +186,12 @@ fn read_var_column(
             // bytes-remaining (or NO_TOTAL); the null terminator occupies buffer
             // space on every read.
             let (cb_read, cb_remaining) = if cb_data == odbc_sys::NO_TOTAL {
-                (cb_available - cb_null_terminator, 1024 * 1024)
+                (cb_available.saturating_sub(cb_null_terminator), 1024 * 1024)
             } else if cb_data as usize >= cb_available {
-                let read = cb_available - cb_null_terminator;
-                (read, cb_data as usize - read)
+                let read = cb_available.saturating_sub(cb_null_terminator);
+                (read, (cb_data as usize).saturating_sub(read))
             } else {
-                (cb_data as usize - cb_null_terminator, 0)
+                ((cb_data as usize).saturating_sub(cb_null_terminator), 0)
             };
 
             cb_used += cb_read;
@@ -204,17 +224,32 @@ pub fn get_data(
     hstmt: HStmt,
     col: usize,
     info: &ColInfo,
+    initsize: usize,
     on_error: &impl Fn(&'static str) -> PyErr,
 ) -> PyResult<CellValue> {
     match info.sql_type {
         SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR | SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR
-        | SQL_GUID => match read_var_column(hstmt, col, CDataType::WChar, on_error)? {
+        | SQL_GUID => match read_var_column(
+            hstmt,
+            col,
+            CDataType::WChar,
+            info.column_size,
+            initsize,
+            on_error,
+        )? {
             None => Ok(CellValue::Null),
             Some(bytes) => Ok(CellValue::Str(utf16_native(&bytes))),
         },
 
         SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => {
-            match read_var_column(hstmt, col, CDataType::Binary, on_error)? {
+            match read_var_column(
+                hstmt,
+                col,
+                CDataType::Binary,
+                info.column_size,
+                initsize,
+                on_error,
+            )? {
                 None => Ok(CellValue::Null),
                 Some(bytes) => Ok(CellValue::Bytes(bytes)),
             }
