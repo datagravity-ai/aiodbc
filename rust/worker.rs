@@ -5,7 +5,7 @@
 // HDBC and its statements (the conservative reading of ODBC driver thread-safety)
 // and matches DB API transaction semantics.  See docs/rust-asyncio-rewrite-plan.md.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -21,6 +21,11 @@ use crate::errors::ProgrammingError;
 pub struct ConnState {
     pub hdbc: usize, // HDbc as usize; 0 = not connected
     pub autocommit: Arc<AtomicBool>,
+    /// Mirror of hdbc readable from the Connection object (for the hdbc property).
+    pub hdbc_public: Arc<AtomicUsize>,
+    /// SQLGetInfo(SQL_NEED_LONG_DATA_LEN), probed at connect; drives how
+    /// data-at-execution parameters declare their length.
+    pub need_long_data_len: bool,
 }
 
 impl ConnState {
@@ -34,6 +39,7 @@ impl ConnState {
         if self.hdbc != 0 {
             let hdbc = self.hdbc_raw();
             self.hdbc = 0;
+            self.hdbc_public.store(0, Ordering::Relaxed);
             unsafe {
                 if !self.autocommit.load(Ordering::Relaxed) {
                     let _ = odbc_sys::SQLEndTran(
@@ -55,7 +61,7 @@ pub type Task = Box<dyn FnOnce(&mut ConnState) -> bool + Send>;
 /// Converts work done on the worker (no GIL) into a Python result (GIL held).
 pub type Finisher = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 
-pub fn spawn(autocommit: Arc<AtomicBool>) -> PyResult<Sender<Task>> {
+pub fn spawn(autocommit: Arc<AtomicBool>, hdbc_public: Arc<AtomicUsize>) -> PyResult<Sender<Task>> {
     let (tx, rx): (Sender<Task>, Receiver<Task>) = channel();
     std::thread::Builder::new()
         .name("pyodbc-connection".into())
@@ -63,6 +69,8 @@ pub fn spawn(autocommit: Arc<AtomicBool>) -> PyResult<Sender<Task>> {
             let mut state = ConnState {
                 hdbc: 0,
                 autocommit,
+                hdbc_public,
+                need_long_data_len: false,
             };
             while let Ok(task) = rx.recv() {
                 if !task(&mut state) {

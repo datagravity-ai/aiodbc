@@ -1,14 +1,17 @@
 // Converting fetched column data into values.  Ported (simplified) from
 // src/getdata.cpp: fetches use SQLGetData per column like the C++ implementation.
-// Phase-1 scope: text, binary, integers, floats, bit, date/time/timestamp; decimals,
-// UUIDs, output converters and configurable encodings come in later phases.
+// Text honors the connection's decoding configuration, DECIMAL/NUMERIC uses the
+// binary SQL_NUMERIC_STRUCT path by default, GUIDs become uuid.UUID under
+// native_uuid, and user output converters receive the raw bytes.
 
 use odbc_sys::{CDataType, HStmt, Len, Pointer, SqlReturn};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDate, PyDateTime, PyTime};
 
 use crate::cursor::ColInfo;
+use crate::decimal_support;
 use crate::errors::ProgrammingError;
+use crate::textenc::{decode, DecodedText, TextEnc};
 
 // SQL type codes (values verified by rust/constants.rs, which is generated from the
 // ODBC headers).
@@ -38,6 +41,26 @@ pub const SQL_WCHAR: i16 = -8;
 pub const SQL_WVARCHAR: i16 = -9;
 pub const SQL_WLONGVARCHAR: i16 = -10;
 pub const SQL_GUID: i16 = -11;
+pub const SQL_SS_XML: i16 = -152;
+
+fn is_wide_type(sql_type: i16) -> bool {
+    matches!(
+        sql_type,
+        SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR | SQL_SS_XML
+    )
+}
+
+/// Per-fetch settings snapshotted (under the GIL) when the fetch is dispatched to
+/// the worker.
+pub struct FetchCtx {
+    pub sqlchar_enc: TextEnc,
+    pub sqlwchar_enc: TextEnc,
+    pub initsize: usize,
+    pub native_uuid: bool,
+    /// SQL types with a registered output converter (the callables themselves stay
+    /// in the connection's map and are invoked by the finisher under the GIL).
+    pub converter_types: Vec<i32>,
+}
 
 /// A fetched cell, safe to move between threads before conversion to Python.
 pub enum CellValue {
@@ -45,8 +68,20 @@ pub enum CellValue {
     Bool(bool),
     I64(i64),
     F64(f64),
-    Str(String),
+    Text(DecodedText),
     Bytes(Vec<u8>),
+    DecimalBin {
+        sign: u8,
+        scale: i8,
+        val: [u8; 16],
+    },
+    DecimalStr(String),
+    Uuid([u8; 16]), // bytes_le, matching the SQLGUID memory layout
+    /// Raw bytes for a user-registered output converter (invoked by the finisher).
+    Converted {
+        sql_type: i16,
+        data: Option<Vec<u8>>,
+    },
     Date {
         year: i32,
         month: u8,
@@ -70,14 +105,31 @@ pub enum CellValue {
 }
 
 impl CellValue {
+    /// Convert to a Python object.  `Converted` cells are handled by the cursor
+    /// finisher (which owns the converter map) before calling this.
     pub fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(match self {
             CellValue::Null => py.None(),
             CellValue::Bool(v) => v.into_pyobject(py)?.to_owned().into_any().unbind(),
             CellValue::I64(v) => v.into_pyobject(py)?.into_any().unbind(),
             CellValue::F64(v) => v.into_pyobject(py)?.into_any().unbind(),
-            CellValue::Str(v) => v.into_pyobject(py)?.into_any().unbind(),
+            CellValue::Text(t) => t.into_py(py)?,
             CellValue::Bytes(v) => PyBytes::new(py, &v).into_any().unbind(),
+            CellValue::DecimalBin { sign, scale, val } => {
+                decimal_support::decimal_from_numeric_parts(py, sign, scale, val)?
+            }
+            CellValue::DecimalStr(text) => decimal_support::decimal_from_text(py, &text)?,
+            CellValue::Uuid(bytes_le) => {
+                let uuid_cls = py.import("uuid")?.getattr("UUID")?;
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("bytes_le", PyBytes::new(py, &bytes_le))?;
+                uuid_cls.call((), Some(&kwargs))?.unbind()
+            }
+            CellValue::Converted { .. } => {
+                return Err(ProgrammingError::new_err(
+                    "internal error: unhandled output-converter cell",
+                ))
+            }
             CellValue::Date { year, month, day } => {
                 PyDate::new(py, year, month, day)?.into_any().unbind()
             }
@@ -211,35 +263,78 @@ fn read_var_column(
     Ok(Some(buf))
 }
 
-fn utf16_native(bytes: &[u8]) -> String {
-    let (pairs, _remainder) = bytes.as_chunks::<2>();
-    let units: Vec<u16> = pairs.iter().map(|c| u16::from_ne_bytes(*c)).collect();
-    String::from_utf16_lossy(&units)
-}
-
-/// Fetch one cell.  Runs on the worker thread, no GIL.  The C-type choices follow
-/// the pyodbc defaults: all text is read as SQL_C_WCHAR (UTF-16), matching the
-/// default TextEnc configuration in connection.cpp.
+/// Fetch one cell.  Runs on the worker thread, no GIL.
 pub fn get_data(
     hstmt: HStmt,
     col: usize,
     info: &ColInfo,
-    initsize: usize,
+    ctx: &FetchCtx,
     on_error: &impl Fn(&'static str) -> PyErr,
 ) -> PyResult<CellValue> {
-    match info.sql_type {
-        SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR | SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR
-        | SQL_GUID => match read_var_column(
+    // A user-registered converter takes precedence and receives the raw bytes.
+    if ctx.converter_types.contains(&(info.sql_type as i32)) {
+        let data = read_var_column(
             hstmt,
             col,
-            CDataType::WChar,
+            CDataType::Binary,
             info.column_size,
-            initsize,
+            ctx.initsize,
             on_error,
-        )? {
-            None => Ok(CellValue::Null),
-            Some(bytes) => Ok(CellValue::Str(utf16_native(&bytes))),
-        },
+        )?;
+        return Ok(CellValue::Converted {
+            sql_type: info.sql_type,
+            data,
+        });
+    }
+
+    match info.sql_type {
+        SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR | SQL_SS_XML | SQL_CHAR | SQL_VARCHAR
+        | SQL_LONGVARCHAR => {
+            let enc = if is_wide_type(info.sql_type) {
+                &ctx.sqlwchar_enc
+            } else {
+                &ctx.sqlchar_enc
+            };
+            let ctype = if enc.wide {
+                CDataType::WChar
+            } else {
+                CDataType::Char
+            };
+            match read_var_column(hstmt, col, ctype, info.column_size, ctx.initsize, on_error)? {
+                None => Ok(CellValue::Null),
+                Some(bytes) => Ok(CellValue::Text(decode(&bytes, enc)?)),
+            }
+        }
+
+        SQL_GUID => {
+            if ctx.native_uuid {
+                let mut guid = odbc_sys::Guid::default();
+                let size = std::mem::size_of::<odbc_sys::Guid>();
+                match get_fixed(hstmt, col, CDataType::Guid, &mut guid, size, on_error)? {
+                    false => Ok(CellValue::Null),
+                    true => {
+                        let mut bytes = [0u8; 16];
+                        bytes[..4].copy_from_slice(&guid.d1.to_le_bytes());
+                        bytes[4..6].copy_from_slice(&guid.d2.to_le_bytes());
+                        bytes[6..8].copy_from_slice(&guid.d3.to_le_bytes());
+                        bytes[8..].copy_from_slice(&guid.d4);
+                        Ok(CellValue::Uuid(bytes))
+                    }
+                }
+            } else {
+                let enc = &ctx.sqlchar_enc;
+                let ctype = if enc.wide {
+                    CDataType::WChar
+                } else {
+                    CDataType::Char
+                };
+                match read_var_column(hstmt, col, ctype, info.column_size, ctx.initsize, on_error)?
+                {
+                    None => Ok(CellValue::Null),
+                    Some(bytes) => Ok(CellValue::Text(decode(&bytes, enc)?)),
+                }
+            }
+        }
 
         SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => {
             match read_var_column(
@@ -247,11 +342,65 @@ pub fn get_data(
                 col,
                 CDataType::Binary,
                 info.column_size,
-                initsize,
+                ctx.initsize,
                 on_error,
             )? {
                 None => Ok(CellValue::Null),
                 Some(bytes) => Ok(CellValue::Bytes(bytes)),
+            }
+        }
+
+        SQL_DECIMAL | SQL_NUMERIC => {
+            if info.use_decimal_binary {
+                // Fetch via the ARD configured at describe time; on driver failure
+                // fall back to the string path like getdata.cpp.
+                let mut num = odbc_sys::Numeric::default();
+                let mut indicator: Len = 0;
+                let size = std::mem::size_of::<odbc_sys::Numeric>();
+                let ret = unsafe {
+                    odbc_sys::SQLGetData(
+                        hstmt,
+                        (col + 1) as u16,
+                        CDataType::Ard,
+                        &mut num as *mut odbc_sys::Numeric as Pointer,
+                        size as Len,
+                        &mut indicator,
+                    )
+                };
+                if succeeded(ret) {
+                    if indicator == odbc_sys::NULL_DATA {
+                        return Ok(CellValue::Null);
+                    }
+                    return Ok(CellValue::DecimalBin {
+                        sign: num.sign,
+                        scale: num.scale,
+                        val: num.val,
+                    });
+                }
+            }
+            // String path: read as text with the SQL_WCHAR decoding (currency
+            // symbols may be non-ASCII), clean, and parse.
+            let enc = &ctx.sqlwchar_enc;
+            let ctype = if enc.wide {
+                CDataType::WChar
+            } else {
+                CDataType::Char
+            };
+            match read_var_column(hstmt, col, ctype, info.column_size, ctx.initsize, on_error)? {
+                None => Ok(CellValue::Null),
+                Some(bytes) => {
+                    let text = match decode(&bytes, enc)? {
+                        DecodedText::Native(s) => s,
+                        // Custom codecs would need the GIL; the characters we keep
+                        // are ASCII, so a lossy latin-1 read is safe here.
+                        DecodedText::Codec(raw, _) => {
+                            raw.iter().map(|&b| b as char).collect::<String>()
+                        }
+                    };
+                    Ok(CellValue::DecimalStr(decimal_support::clean_decimal_text(
+                        &text,
+                    )))
+                }
             }
         }
 
@@ -358,15 +507,31 @@ fn get_fixed<T>(
 }
 
 /// The Python class corresponding to a SQL type, for Cursor.description.  Ported
-/// from PythonTypeFromSqlType in getdata.cpp (decimal/uuid handling comes with the
-/// phases that implement those types).
-pub fn python_type_for_sql_type(py: Python<'_>, sql_type: i16) -> PyResult<Py<PyAny>> {
+/// from PythonTypeFromSqlType in getdata.cpp.
+pub fn python_type_for_sql_type(
+    py: Python<'_>,
+    sql_type: i16,
+    native_uuid: bool,
+    has_converter: bool,
+) -> PyResult<Py<PyAny>> {
     use pyo3::type_object::PyTypeInfo;
     use pyo3::types::{PyBool, PyByteArray, PyFloat, PyInt, PyString};
 
+    if has_converter {
+        // Matches PythonTypeFromSqlType: converter output is reported as str.
+        return Ok(PyString::type_object(py).into_any().unbind());
+    }
+
     let ty = match sql_type {
         SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR
-        | SQL_GUID => PyString::type_object(py).into_any(),
+        | SQL_SS_XML => PyString::type_object(py).into_any(),
+        SQL_GUID => {
+            if native_uuid {
+                py.import("uuid")?.getattr("UUID")?
+            } else {
+                PyString::type_object(py).into_any()
+            }
+        }
         SQL_DECIMAL | SQL_NUMERIC => py.import("decimal")?.getattr("Decimal")?,
         SQL_REAL | SQL_FLOAT | SQL_DOUBLE => PyFloat::type_object(py).into_any(),
         SQL_SMALLINT | SQL_INTEGER | SQL_TINYINT | SQL_BIGINT => PyInt::type_object(py).into_any(),

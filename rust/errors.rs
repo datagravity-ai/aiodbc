@@ -84,6 +84,17 @@ const DEFAULT_ERROR: &str = "The driver did not supply an error!";
 /// platforms (some Unix drivers crash on repeated SQLGetDiagRec calls); on Windows
 /// the remaining records are appended as "; [sqlstate] message (native_error)".
 pub fn error_from_handle(function: &str, handle_type: HandleType, handle: Handle) -> PyErr {
+    error_from_handle_ex(function, handle_type, handle, false)
+}
+
+/// error_from_handle with the compat_diagrec_byte_length workaround: some drivers
+/// report the diagnostic text length in bytes instead of characters (issue #489).
+pub fn error_from_handle_ex(
+    function: &str,
+    handle_type: HandleType,
+    handle: Handle,
+    text_length_in_bytes: bool,
+) -> PyErr {
     let mut first_state = String::new();
     let mut msg = String::new();
 
@@ -109,6 +120,9 @@ pub fn error_from_handle(function: &str, handle_type: HandleType, handle: Handle
         if !matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO) {
             break;
         }
+        if text_length_in_bytes {
+            cch /= 2;
+        }
 
         // If the message was truncated, retry with a buffer sized to fit.
         if cch as usize > buf.len() - 1 {
@@ -127,6 +141,9 @@ pub fn error_from_handle(function: &str, handle_type: HandleType, handle: Handle
             };
             if !matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO) {
                 break;
+            }
+            if text_length_in_bytes {
+                cch /= 2;
             }
         }
 

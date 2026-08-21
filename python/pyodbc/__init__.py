@@ -7,6 +7,7 @@ module assembles the public API on top of it.
 """
 
 import datetime as _datetime
+import locale as _locale
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
@@ -62,6 +63,27 @@ def TimeFromTicks(ticks):  # noqa: N802
 def TimestampFromTicks(ticks):  # noqa: N802
     """Return a datetime object, given the ticks value (number of seconds since the epoch)."""
     return _datetime.datetime.fromtimestamp(ticks)
+
+
+# The decimal separator used when parsing NUMERIC/DECIMAL text defaults to the
+# locale's, like InitializeDecimal in decimal.cpp.  setDecimalSeparator overrides it.
+try:
+    _core.set_decimal_separator(_locale.localeconv().get('decimal_point', '.'))
+except Exception:
+    _core.set_decimal_separator('.')
+
+# Historical camelCase names for the decimal separator functions.
+setDecimalSeparator = _core.set_decimal_separator  # noqa: N816
+getDecimalSeparator = _core.get_decimal_separator  # noqa: N816
+
+
+def __getattr__(name):
+    # pyodbc.henv: the shared ODBC environment handle, allocated on first use like
+    # the C++ module's mod_getattr.
+    if name == 'henv':
+        import ctypes
+        return ctypes.c_void_p(_core._henv())
+    raise AttributeError(f"module 'pyodbc' has no attribute '{name}'")
 
 
 # Map DB API recommended connect() keywords to ODBC connection string keywords,
