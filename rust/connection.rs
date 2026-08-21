@@ -2,11 +2,13 @@
 // from docs/rust-asyncio-rewrite-plan.md: every connection owns a worker thread and
 // all ODBC calls for it (and its cursors) run there, in order.  Async methods
 // return asyncio futures; a few sync properties (autocommit, timeout) dispatch to
-// the worker and block briefly.
+// the worker and block briefly.  Pure-configuration state (encodings, converters,
+// maxwrite, ...) is stored on the connection and snapshotted per operation.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use odbc_sys::{
     CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, Handle, HandleType, Pointer,
@@ -17,11 +19,26 @@ use pyo3::types::PyTuple;
 
 use crate::cursor::Cursor;
 use crate::errors::{error_from_handle, OperationalError, ProgrammingError};
+use crate::getinfo_types::{InfoKind, GETINFO_TYPES};
+use crate::textenc::{self, ConnEncodings, SQL_CHAR, SQL_WCHAR, SQL_WMETADATA};
 use crate::worker::{
     self, closed_connection_err, dispatch_future, dispatch_future_terminal, dispatch_sync,
     ConnState, Finisher, Task,
 };
 use crate::{async_bridge, env};
+
+// SQLGetInfo bound with a raw u16 info type: odbc-sys models InfoType as an enum
+// that doesn't cover everything in the aInfoTypes table.
+extern "system" {
+    #[link_name = "SQLGetInfo"]
+    fn RawSQLGetInfo(
+        hdbc: HDbc,
+        info_type: u16,
+        value: Pointer,
+        buffer_length: i16,
+        string_length: *mut i16,
+    ) -> SqlReturn;
+}
 
 fn succeeded(ret: SqlReturn) -> bool {
     matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO)
@@ -31,6 +48,9 @@ fn succeeded(ret: SqlReturn) -> bool {
 const SQL_AUTOCOMMIT_OFF: usize = 0;
 const SQL_AUTOCOMMIT_ON: usize = 1;
 const SQL_MODE_READ_ONLY: usize = 1;
+const SQL_NEED_LONG_DATA_LEN: u16 = 111;
+
+pub type ConverterMap = Arc<Mutex<HashMap<i32, Py<PyAny>>>>;
 
 #[pyclass(module = "pyodbc")]
 pub struct Connection {
@@ -39,6 +59,12 @@ pub struct Connection {
     autocommit_flag: Arc<AtomicBool>,
     timeout_cache: Arc<AtomicU32>,
     readvar_initsize: Arc<AtomicUsize>,
+    maxwrite_value: Arc<AtomicUsize>,
+    fetch_decimal_as_string_flag: Arc<AtomicBool>,
+    compat_diagrec: Arc<AtomicBool>,
+    hdbc_public: Arc<AtomicUsize>,
+    encodings: Arc<Mutex<ConnEncodings>>,
+    converters: ConverterMap,
 }
 
 impl Connection {
@@ -51,12 +77,32 @@ impl Connection {
         self.tx.as_ref().ok_or_else(closed_connection_err)
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.closed
+    pub fn encodings_snapshot(&self) -> ConnEncodings {
+        self.encodings.lock().unwrap().clone()
     }
 
-    pub fn autocommit_shared(&self) -> Arc<AtomicBool> {
-        self.autocommit_flag.clone()
+    pub fn converter_map(&self) -> ConverterMap {
+        self.converters.clone()
+    }
+
+    pub fn converter_types(&self) -> Vec<i32> {
+        self.converters.lock().unwrap().keys().copied().collect()
+    }
+
+    pub fn readvar_initsize_value(&self) -> usize {
+        self.readvar_initsize.load(Ordering::Relaxed)
+    }
+
+    pub fn maxwrite_setting(&self) -> usize {
+        self.maxwrite_value.load(Ordering::Relaxed)
+    }
+
+    pub fn fetch_decimal_as_string_value(&self) -> bool {
+        self.fetch_decimal_as_string_flag.load(Ordering::Relaxed)
+    }
+
+    pub fn diagrec_byte_length(&self) -> bool {
+        self.compat_diagrec.load(Ordering::Relaxed)
     }
 
     /// Enqueue a commit or rollback and return the future.  Shared with Cursor.
@@ -134,24 +180,18 @@ impl Connection {
         self.closed
     }
 
-    /// Initial buffer size in bytes for reading variable-length columns; 0 means
-    /// size the buffer from the column descriptor.  Stored only - it is consulted
-    /// on the worker at fetch time, so the setter needs no ODBC round-trip.
+    /// The raw ODBC connection handle as ctypes.c_void_p, or None once closed.
     #[getter]
-    fn readvar_initsize(&self) -> usize {
-        self.readvar_initsize.load(Ordering::Relaxed)
-    }
-
-    #[setter]
-    fn set_readvar_initsize(&self, value: i64) -> PyResult<()> {
-        if value < 0 {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Cannot set readvar_initsize to a negative value.",
-            ));
+    fn hdbc(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.closed {
+            return Ok(py.None());
         }
-        self.readvar_initsize
-            .store(value as usize, Ordering::Relaxed);
-        Ok(())
+        let value = self.hdbc_public.load(Ordering::Relaxed);
+        Ok(py
+            .import("ctypes")?
+            .getattr("c_void_p")?
+            .call1((value,))?
+            .unbind())
     }
 
     #[getter]
@@ -187,16 +227,212 @@ impl Connection {
         })
     }
 
+    /// Initial buffer size in bytes for reading variable-length columns; 0 means
+    /// size the buffer from the column descriptor.  Stored only - it is consulted
+    /// on the worker at fetch time, so the setter needs no ODBC round-trip.
+    #[getter]
+    fn readvar_initsize(&self) -> usize {
+        self.readvar_initsize.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_readvar_initsize(&self, value: i64) -> PyResult<()> {
+        if value < 0 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Cannot set readvar_initsize to a negative value.",
+            ));
+        }
+        self.readvar_initsize
+            .store(value as usize, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Maximum bytes to write per SQLBindParameter buffer; longer values stream via
+    /// SQLPutData.  0 (the default) means no maximum.
+    #[getter]
+    fn maxwrite(&self) -> usize {
+        self.maxwrite_value.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_maxwrite(&self, value: i64) -> PyResult<()> {
+        if value < 0 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Cannot set maxwrite to a negative value.",
+            ));
+        }
+        self.maxwrite_value.store(value as usize, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// If True, DECIMAL/NUMERIC values are fetched via the legacy locale-aware
+    /// string path instead of the binary SQL_NUMERIC_STRUCT representation.
+    #[getter]
+    fn fetch_decimal_as_string(&self) -> bool {
+        self.fetch_decimal_as_string_flag.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_fetch_decimal_as_string(&self, value: bool) {
+        self.fetch_decimal_as_string_flag
+            .store(value, Ordering::Relaxed);
+    }
+
+    /// Workaround for drivers that report diagnostic text length in bytes instead
+    /// of characters (https://github.com/mkleehammer/pyodbc/issues/489).
+    #[getter]
+    fn compat_diagrec_byte_length(&self) -> bool {
+        self.compat_diagrec.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_compat_diagrec_byte_length(&self, value: bool) {
+        self.compat_diagrec.store(value, Ordering::Relaxed);
+    }
+
+    /// Set the text encoding for SQL statements and textual parameters.
+    #[pyo3(signature = (encoding=None, ctype=None))]
+    fn setencoding(
+        &self,
+        py: Python<'_>,
+        encoding: Option<&str>,
+        ctype: Option<i32>,
+    ) -> PyResult<()> {
+        let encoding = encoding
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("encoding is required"))?;
+        let enc = textenc::make_text_enc(py, encoding, ctype)?;
+        self.encodings.lock().unwrap().unicode = enc;
+        Ok(())
+    }
+
+    /// Set the decoding used when reading SQL_CHAR, SQL_WCHAR, or metadata.
+    #[pyo3(signature = (sqltype, encoding=None, ctype=None))]
+    fn setdecoding(
+        &self,
+        py: Python<'_>,
+        sqltype: i32,
+        encoding: Option<&str>,
+        ctype: Option<i32>,
+    ) -> PyResult<()> {
+        if sqltype != SQL_CHAR && sqltype != SQL_WCHAR && sqltype != SQL_WMETADATA {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid sqltype {sqltype}.  Must be SQL_CHAR or SQL_WCHAR or SQL_WMETADATA"
+            )));
+        }
+        let encoding = encoding
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("encoding is required"))?;
+        let enc = textenc::make_text_enc(py, encoding, ctype)?;
+        let mut encodings = self.encodings.lock().unwrap();
+        match sqltype {
+            SQL_CHAR => encodings.sqlchar = enc,
+            SQL_WMETADATA => encodings.metadata = enc,
+            _ => encodings.sqlwchar = enc,
+        }
+        Ok(())
+    }
+
+    /// Register an output converter for a SQL type (None removes it).
+    #[pyo3(signature = (sqltype, func, /))]
+    fn add_output_converter(&self, sqltype: i32, func: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let mut map = self.converters.lock().unwrap();
+        match func {
+            Some(f) => {
+                map.insert(sqltype, f.unbind());
+            }
+            None => {
+                map.remove(&sqltype);
+            }
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (sqltype, /))]
+    fn get_output_converter(&self, py: Python<'_>, sqltype: i32) -> Option<Py<PyAny>> {
+        self.converters
+            .lock()
+            .unwrap()
+            .get(&sqltype)
+            .map(|f| f.clone_ref(py))
+    }
+
+    #[pyo3(signature = (sqltype, /))]
+    fn remove_output_converter(&self, sqltype: i32) {
+        self.converters.lock().unwrap().remove(&sqltype);
+    }
+
+    fn clear_output_converters(&self) {
+        self.converters.lock().unwrap().clear();
+    }
+
+    /// Retrieve driver/data source information via SQLGetInfo.
+    #[pyo3(signature = (infotype, /))]
+    fn getinfo(&self, py: Python<'_>, infotype: u32) -> PyResult<Py<PyAny>> {
+        let kind = GETINFO_TYPES
+            .iter()
+            .find(|(t, _)| *t as u32 == infotype)
+            .map(|(_, k)| *k)
+            .ok_or_else(|| {
+                ProgrammingError::new_err(format!("Unsupported getinfo value: {infotype}"))
+            })?;
+
+        dispatch_future(py, self.channel()?, move |state| {
+            if state.hdbc == 0 {
+                return Err(closed_connection_err());
+            }
+            let mut buffer = [0u8; 0x1000];
+            let mut cch: i16 = 0;
+            let ret = unsafe {
+                RawSQLGetInfo(
+                    state.hdbc as HDbc,
+                    infotype as u16,
+                    buffer.as_mut_ptr() as Pointer,
+                    buffer.len() as i16,
+                    &mut cch,
+                )
+            };
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    "SQLGetInfo",
+                    HandleType::Dbc,
+                    state.hdbc as Handle,
+                ));
+            }
+
+            enum Info {
+                Bool(bool),
+                Text(String),
+                UInt(u32),
+                USmallInt(u16),
+            }
+            let value = match kind {
+                InfoKind::YesNo => Info::Bool(buffer[0] == b'Y'),
+                InfoKind::Str => {
+                    let len = (cch.max(0) as usize).min(buffer.len());
+                    Info::Text(String::from_utf8_lossy(&buffer[..len]).into_owned())
+                }
+                InfoKind::UInt => Info::UInt(u32::from_ne_bytes(buffer[..4].try_into().unwrap())),
+                InfoKind::USmallInt => {
+                    Info::USmallInt(u16::from_ne_bytes(buffer[..2].try_into().unwrap()))
+                }
+            };
+
+            Ok(Box::new(move |py: Python<'_>| {
+                Ok(match value {
+                    Info::Bool(v) => v.into_pyobject(py)?.to_owned().into_any().unbind(),
+                    Info::Text(v) => v.into_pyobject(py)?.into_any().unbind(),
+                    Info::UInt(v) => v.into_pyobject(py)?.into_any().unbind(),
+                    Info::USmallInt(v) => v.into_pyobject(py)?.into_any().unbind(),
+                })
+            }) as Finisher)
+        })
+    }
+
     /// Create a new cursor.  Synchronous: the statement handle is allocated lazily
     /// on the worker at first use.
     fn cursor(slf: &Bound<'_, Self>) -> PyResult<Cursor> {
         let this = slf.borrow();
         let tx = this.channel()?.clone();
-        Ok(Cursor::new(
-            tx,
-            slf.clone().unbind(),
-            this.readvar_initsize.clone(),
-        ))
+        Ok(Cursor::new(tx, slf.clone().unbind()))
     }
 
     /// Convenience: create a cursor and execute on it.  Returns a future resolving
@@ -381,14 +617,30 @@ fn do_connect(
         }
     }
 
+    // Whether long DAE parameters must declare their length up front
+    // (SQL_NEED_LONG_DATA_LEN; see CnxnInfo in cnxninfo.cpp).
+    let mut buf = [0u8; 4];
+    let mut cch: i16 = 0;
+    let ret = unsafe {
+        RawSQLGetInfo(
+            hdbc as HDbc,
+            SQL_NEED_LONG_DATA_LEN,
+            buf.as_mut_ptr() as Pointer,
+            buf.len() as i16,
+            &mut cch,
+        )
+    };
+    state.need_long_data_len = succeeded(ret) && buf[0] == b'Y';
+
     state.hdbc = hdbc as usize;
+    state.hdbc_public.store(hdbc as usize, Ordering::Relaxed);
     Ok(())
 }
 
 fn encode_connection_string(connstring: &str, encoding: Option<&str>) -> PyResult<Vec<u16>> {
     // The driver manager's W entry point wants UTF-16 in native byte order.  The
     // encoding parameter exists for drivers with unusual expectations; only the
-    // UTF-16 family is supported so far (others come with the textenc port).
+    // UTF-16 family is supported so far.
     let normalized = encoding.unwrap_or("utf-16le").to_ascii_lowercase();
     let native: Vec<u16> = connstring.encode_utf16().collect();
     match normalized.as_str() {
@@ -420,7 +672,8 @@ pub fn connect(
     let wcs = encode_connection_string(connstring, encoding)?;
 
     let autocommit_flag = Arc::new(AtomicBool::new(autocommit));
-    let tx = worker::spawn(autocommit_flag.clone())?;
+    let hdbc_public = Arc::new(AtomicUsize::new(0));
+    let tx = worker::spawn(autocommit_flag.clone(), hdbc_public.clone())?;
 
     let conn = Py::new(
         py,
@@ -430,6 +683,12 @@ pub fn connect(
             autocommit_flag,
             timeout_cache: Arc::new(AtomicU32::new(0)),
             readvar_initsize: Arc::new(AtomicUsize::new(4096)),
+            maxwrite_value: Arc::new(AtomicUsize::new(0)),
+            fetch_decimal_as_string_flag: Arc::new(AtomicBool::new(false)),
+            compat_diagrec: Arc::new(AtomicBool::new(false)),
+            hdbc_public,
+            encodings: Arc::new(Mutex::new(ConnEncodings::default())),
+            converters: Arc::new(Mutex::new(HashMap::new())),
         },
     )?;
     let conn_result: Py<PyAny> = conn.clone_ref(py).into_any();

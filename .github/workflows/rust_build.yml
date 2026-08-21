@@ -115,20 +115,9 @@ jobs:
         EOF
 
     - name: Run the SQLite test suite
-      # The deselected tests are the features not yet ported to the Rust core —
-      # the work list for phases 3-5 of docs/rust-asyncio-rewrite-plan.md:
-      # getinfo (phase 5), Row pickling and rows_as_dicts (phase 3), and the
-      # henv/hdbc/hstmt handle exposure (phase 5).  Remove entries as they land.
       run: |
         pip install -r requirements-dev.txt
-        python -m pytest tests/sqlite_test.py --no-header -q \
-          --deselect tests/sqlite_test.py::test_getinfo_string \
-          --deselect tests/sqlite_test.py::test_getinfo_bool \
-          --deselect tests/sqlite_test.py::test_getinfo_int \
-          --deselect tests/sqlite_test.py::test_getinfo_smallint \
-          --deselect tests/sqlite_test.py::test_pickling \
-          --deselect tests/sqlite_test.py::test_handles \
-          --deselect tests/sqlite_test.py::test_rows_as_dicts
+        python -m pytest tests/sqlite_test.py --no-header -q
 
     - name: Check generated constants are up to date
       run: |

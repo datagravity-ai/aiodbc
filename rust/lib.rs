@@ -10,15 +10,26 @@ mod async_bridge;
 mod connection;
 mod constants;
 mod cursor;
+mod decimal_support;
 mod env;
 mod errors;
 mod getdata;
+mod getinfo_types;
 mod params;
 mod row;
+mod textenc;
 mod worker;
 
 fn succeeded(ret: SqlReturn) -> bool {
     matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO)
+}
+
+/// The shared ODBC environment handle, allocating it on first use.  The Python
+/// layer exposes it as pyodbc.henv (a ctypes.c_void_p).
+#[pyfunction]
+#[pyo3(name = "_henv")] // underscored so `from pyodbc._core import *` skips it
+fn henv(py: Python<'_>) -> PyResult<usize> {
+    Ok(env::get_env(py)? as usize)
 }
 
 /// Return the names of the installed ODBC drivers, from SQLDrivers.
@@ -151,6 +162,9 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connection::connect, m)?)?;
     m.add_function(wrap_pyfunction!(drivers, m)?)?;
     m.add_function(wrap_pyfunction!(data_sources, m)?)?;
+    m.add_function(wrap_pyfunction!(henv, m)?)?;
+    m.add_function(wrap_pyfunction!(decimal_support::set_decimal_separator, m)?)?;
+    m.add_function(wrap_pyfunction!(decimal_support::get_decimal_separator, m)?)?;
 
     Ok(())
 }

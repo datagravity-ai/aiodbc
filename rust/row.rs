@@ -1,11 +1,11 @@
-// The Row type: tuple-like result rows with access by column name.  Ported
-// (simplified) from src/row.cpp.  Pickling and column value assignment come in a
-// later phase.
+// The Row type: tuple-like result rows with access by column name.  Ported from
+// src/row.cpp: rows support item/attribute assignment (to "fix up" fetched data),
+// pickling via __reduce__, and compare like tuples.
 
-use pyo3::exceptions::{PyAttributeError, PyIndexError, PyKeyError};
+use pyo3::exceptions::{PyAttributeError, PyIndexError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
-use pyo3::types::{PyDict, PySlice, PyString, PyTuple};
+use pyo3::types::{PyDict, PySlice, PyTuple, PyType};
 
 #[pyclass(module = "pyodbc")]
 pub struct Row {
@@ -21,10 +21,61 @@ impl Row {
     fn as_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, self.values.iter().map(|v| v.bind(py)))
     }
+
+    fn resolve_index(&self, py: Python<'_>, name: &str) -> PyResult<Option<usize>> {
+        match self.name_map.bind(py).get_item(name)? {
+            Some(index) => Ok(Some(index.extract()?)),
+            None => Ok(None),
+        }
+    }
 }
 
 #[pymethods]
 impl Row {
+    /// Only used by unpickling: Row(description, name_map, *values), the state
+    /// produced by __reduce__ (row.cpp new_check).
+    #[new]
+    #[pyo3(signature = (*args))]
+    fn new(args: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        let usage =
+            || PyTypeError::new_err("Row objects cannot be constructed directly (unpickling only)");
+        if args.len() < 2 {
+            return Err(usage());
+        }
+        let description = args.get_item(0)?;
+        let name_map = args.get_item(1)?;
+        if !description.is_instance_of::<PyTuple>() || !name_map.is_instance_of::<PyDict>() {
+            return Err(usage());
+        }
+        let cols = description.downcast::<PyTuple>()?.len();
+        if args.len() - 2 != cols {
+            return Err(usage());
+        }
+        let values = (2..args.len())
+            .map(|i| Ok(args.get_item(i)?.unbind()))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Row {
+            values,
+            description: description.unbind(),
+            name_map: name_map.downcast::<PyDict>()?.clone().unbind(),
+        })
+    }
+
+    /// Supports pickling: (RowType, (description, name_map, *values)).
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyType>, Bound<'py, PyTuple>)> {
+        let this = slf.borrow();
+        let mut state: Vec<Bound<'py, PyAny>> = Vec::with_capacity(2 + this.values.len());
+        state.push(this.description.bind(py).clone());
+        state.push(this.name_map.bind(py).clone().into_any());
+        for v in &this.values {
+            state.push(v.bind(py).clone());
+        }
+        Ok((slf.get_type(), PyTuple::new(py, state)?))
+    }
+
     #[getter]
     fn cursor_description(&self, py: Python<'_>) -> Py<PyAny> {
         self.description.clone_ref(py)
@@ -35,10 +86,21 @@ impl Row {
     }
 
     fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        match self.name_map.bind(py).get_item(name)? {
-            Some(index) => {
-                let i: usize = index.extract()?;
-                Ok(self.values[i].clone_ref(py))
+        match self.resolve_index(py, name)? {
+            Some(i) => Ok(self.values[i].clone_ref(py)),
+            None => Err(PyAttributeError::new_err(format!(
+                "Row object has no attribute '{name}'"
+            ))),
+        }
+    }
+
+    fn __setattr__(&mut self, py: Python<'_>, name: &str, value: Bound<'_, PyAny>) -> PyResult<()> {
+        // Like Row_setattro: a column name assigns the column; anything else fails
+        // (rows have no instance dict, like tuples).
+        match self.resolve_index(py, name)? {
+            Some(i) => {
+                self.values[i] = value.unbind();
+                Ok(())
             }
             None => Err(PyAttributeError::new_err(format!(
                 "Row object has no attribute '{name}'"
@@ -83,18 +145,41 @@ impl Row {
             return Ok(PyTuple::new(py, out)?.into_any().unbind());
         }
 
-        // Allow row['colname'] as row.cpp does for mapping-style access.
-        if let Ok(name) = key.downcast::<PyString>() {
-            if let Some(index) = this.name_map.bind(py).get_item(name)? {
-                let i: usize = index.extract()?;
-                return Ok(this.values[i].clone_ref(py));
-            }
-            return Err(PyKeyError::new_err(name.to_string()));
-        }
+        // Rows are sequences, not mappings (row.cpp Row_subscript).
+        Err(PyTypeError::new_err(format!(
+            "row indices must be integers, not {}",
+            key.get_type().name()?
+        )))
+    }
 
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "row indices must be integers, slices, or column names",
-        ))
+    fn __setitem__(&mut self, key: &Bound<'_, PyAny>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let n = self.values.len() as isize;
+        let mut index: isize = key.extract().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "row indices must be integers, not {}",
+                key.get_type()
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            ))
+        })?;
+        if index < 0 {
+            index += n;
+        }
+        if index < 0 || index >= n {
+            return Err(PyIndexError::new_err("Row assignment index out of range"));
+        }
+        self.values[index as usize] = value.unbind();
+        Ok(())
+    }
+
+    fn __contains__(&self, py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<bool> {
+        for v in &self.values {
+            if v.bind(py).eq(item)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn __iter__(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {

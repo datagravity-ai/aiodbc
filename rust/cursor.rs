@@ -2,24 +2,24 @@
 // ODBC call is enqueued on the parent connection's worker and returned to Python as
 // an asyncio future.  The HSTMT is allocated lazily on first use.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use odbc_sys::{
-    CompletionType, FreeStmtOption, HStmt, Handle, HandleType, Len, Nullability, SqlDataType,
-    SqlReturn,
+    CompletionType, Desc, FreeStmtOption, HDesc, HStmt, Handle, HandleType, Len, Nullability,
+    Pointer, SqlDataType, SqlReturn, StatementAttribute,
 };
 use pyo3::exceptions::{PyStopAsyncIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 use crate::async_bridge;
-use crate::connection::Connection;
-use crate::errors::{error_from_handle, ProgrammingError};
-use crate::getdata::{self, CellValue};
+use crate::connection::{Connection, ConverterMap};
+use crate::errors::{error_from_handle, error_from_handle_ex, ProgrammingError};
+use crate::getdata::{self, CellValue, FetchCtx};
 use crate::params::{self, BoundParam, ParamValue};
 use crate::row::Row;
+use crate::textenc::{self, DecodedText, TextEnc};
 use crate::worker::{dispatch_future, Finisher, Task};
 
 fn succeeded(ret: SqlReturn) -> bool {
@@ -34,21 +34,38 @@ fn no_results_err() -> PyErr {
     ProgrammingError::new_err("No results.  Previous SQL was not a query.")
 }
 
+// SQL_C_NUMERIC, for the decimal ARD setup (sqlext.h).
+const SQL_C_NUMERIC: usize = 2;
+
 /// Metadata for one result column, produced on the worker after an execute.
 #[derive(Clone)]
 pub struct ColInfo {
     pub sql_type: i16,
     pub column_size: u64,
+    pub use_decimal_binary: bool,
 }
 
 /// Raw column description read via SQLDescribeColW, converted into the Python
 /// `description` tuple under the GIL by the execute finisher.
 struct RawCol {
-    name: String,
+    name: DecodedText,
     sql_type: i16,
     column_size: u64,
     decimal_digits: i16,
     nullable: Nullability,
+    use_decimal_binary: bool,
+}
+
+/// One diagnostic record for Cursor.messages.
+struct RawDiag {
+    state: String,
+    native: i32,
+    text: MsgText,
+}
+
+enum MsgText {
+    Decoded(DecodedText),
+    Raw(Vec<u8>),
 }
 
 /// State shared between the Cursor object and the tasks it enqueues.  ODBC fields
@@ -60,6 +77,7 @@ pub struct CursorShared {
     pub description: Option<Py<PyAny>>,
     pub name_map: Option<Py<PyDict>>,
     pub rowcount: i64,
+    pub messages: Option<Py<PyAny>>,
 }
 
 #[pyclass(module = "pyodbc")]
@@ -68,9 +86,11 @@ pub struct Cursor {
     connection: Py<Connection>,
     shared: Arc<Mutex<CursorShared>>,
     closed: bool,
-    readvar_initsize: Arc<AtomicUsize>,
     #[pyo3(get, set)]
     arraysize: usize,
+    /// If True, rows are returned as dicts keyed by column name.
+    #[pyo3(get, set)]
+    rows_as_dicts: bool,
 }
 
 enum ExecuteRows {
@@ -87,33 +107,46 @@ enum FetchMode {
     Next, // __anext__: raises StopAsyncIteration when exhausted
 }
 
+/// Everything the worker needs for one execute, snapshotted under the GIL.
+struct ExecCtx {
+    sql_bytes: Vec<u8>,
+    sql_wide: bool,
+    maxwrite: usize,
+    metadata_enc: TextEnc,
+    fetch_decimal_as_string: bool,
+    byte_len_diag: bool,
+}
+
 /// Ported from IsSequence in cursor.cpp: only list, tuple, and Row count as a
 /// parameter collection.
 fn is_param_sequence(obj: &Bound<'_, PyAny>) -> bool {
     obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() || obj.is_instance_of::<Row>()
 }
 
-fn extract_param_row(row: &Bound<'_, PyAny>) -> PyResult<Vec<ParamValue>> {
+fn extract_param_row(row: &Bound<'_, PyAny>, unicode_enc: &TextEnc) -> PyResult<Vec<ParamValue>> {
     let mut out = Vec::new();
     for (i, cell) in row.try_iter()?.enumerate() {
-        out.push(params::extract(&cell?, i)?);
+        out.push(params::extract(&cell?, i, unicode_enc)?);
     }
     Ok(out)
 }
 
+fn module_flag(py: Python<'_>, name: &str) -> bool {
+    py.import("pyodbc")
+        .and_then(|m| m.getattr(name))
+        .and_then(|v| v.extract())
+        .unwrap_or(false)
+}
+
 impl Cursor {
-    pub fn new(
-        tx: Sender<Task>,
-        connection: Py<Connection>,
-        readvar_initsize: Arc<AtomicUsize>,
-    ) -> Self {
+    pub fn new(tx: Sender<Task>, connection: Py<Connection>) -> Self {
         Cursor {
             tx,
             connection,
             shared: Arc::new(Mutex::new(CursorShared::default())),
             closed: false,
-            readvar_initsize,
             arraysize: 1,
+            rows_as_dicts: false,
         }
     }
 
@@ -126,6 +159,18 @@ impl Cursor {
         Ok(())
     }
 
+    fn fetch_ctx(&self, py: Python<'_>) -> FetchCtx {
+        let conn = self.connection.bind(py).borrow();
+        let encs = conn.encodings_snapshot();
+        FetchCtx {
+            sqlchar_enc: encs.sqlchar,
+            sqlwchar_enc: encs.sqlwchar,
+            initsize: conn.readvar_initsize_value(),
+            native_uuid: module_flag(py, "native_uuid"),
+            converter_types: conn.converter_types(),
+        }
+    }
+
     /// Shared by Cursor.execute and Connection.execute.
     pub fn execute_on(
         slf: &Bound<'_, Cursor>,
@@ -133,18 +178,25 @@ impl Cursor {
         sql: &str,
         params_tuple: &Bound<'_, PyTuple>,
     ) -> PyResult<Py<PyAny>> {
+        let unicode_enc = slf
+            .borrow()
+            .connection
+            .bind(py)
+            .borrow()
+            .encodings_snapshot()
+            .unicode;
         // Figure out how parameters were passed (cursor.cpp Cursor_execute): a
         // single list/tuple/Row argument is the parameter collection; otherwise
         // the positional arguments themselves are the parameters.
         let values = if params_tuple.len() == 1 {
             let first = params_tuple.get_item(0)?;
             if is_param_sequence(&first) {
-                extract_param_row(&first)?
+                extract_param_row(&first, &unicode_enc)?
             } else {
-                extract_param_row(params_tuple.as_any())?
+                extract_param_row(params_tuple.as_any(), &unicode_enc)?
             }
         } else {
-            extract_param_row(params_tuple.as_any())?
+            extract_param_row(params_tuple.as_any(), &unicode_enc)?
         };
         Self::run_execute(slf, py, sql, ExecuteRows::One(values))
     }
@@ -158,14 +210,27 @@ impl Cursor {
         let this = slf.borrow();
         this.validate(py)?;
 
-        let lowercase: bool = py
-            .import("pyodbc")
-            .and_then(|m| m.getattr("lowercase"))
-            .and_then(|v| v.extract())
-            .unwrap_or(false);
+        let lowercase = module_flag(py, "lowercase");
+        let native_uuid = module_flag(py, "native_uuid");
+
+        let (ctx, converter_types) = {
+            let conn = this.connection.bind(py).borrow();
+            let encs = conn.encodings_snapshot();
+            let sql_bytes = textenc::encode(py, sql, &encs.unicode)?;
+            (
+                ExecCtx {
+                    sql_bytes,
+                    sql_wide: encs.unicode.wide,
+                    maxwrite: conn.maxwrite_setting(),
+                    metadata_enc: encs.metadata,
+                    fetch_decimal_as_string: conn.fetch_decimal_as_string_value(),
+                    byte_len_diag: conn.diagrec_byte_length(),
+                },
+                conn.converter_types(),
+            )
+        };
 
         let shared = this.shared.clone();
-        let sql_w: Vec<u16> = sql.encode_utf16().collect();
         let cursor_obj: Py<PyAny> = slf.clone().into_any().unbind();
 
         dispatch_future(py, &this.tx, move |state| {
@@ -175,7 +240,8 @@ impl Cursor {
             let hstmt = ensure_hstmt(state, &shared)?;
             free_results(hstmt);
 
-            let (rowcount, raw_cols) = execute_odbc(hstmt, &sql_w, rows)?;
+            let need_long = state.need_long_data_len;
+            let (rowcount, raw_cols, diags) = execute_odbc(hstmt, &ctx, rows, need_long)?;
 
             {
                 let mut guard = shared.lock().unwrap();
@@ -184,16 +250,20 @@ impl Cursor {
                     .map(|c| ColInfo {
                         sql_type: c.sql_type,
                         column_size: c.column_size,
+                        use_decimal_binary: c.use_decimal_binary,
                     })
                     .collect();
                 guard.rowcount = rowcount;
             }
 
             Ok(Box::new(move |py: Python<'_>| {
-                let (description, name_map) = build_description(py, &raw_cols, lowercase)?;
+                let (description, name_map) =
+                    build_description(py, &raw_cols, lowercase, native_uuid, &converter_types)?;
+                let messages = build_messages(py, diags)?;
                 let mut guard = shared.lock().unwrap();
                 guard.description = description;
                 guard.name_map = name_map;
+                guard.messages = Some(messages);
                 drop(guard);
                 Ok(cursor_obj)
             }) as Finisher)
@@ -203,7 +273,9 @@ impl Cursor {
     fn fetch_future(&self, py: Python<'_>, mode: FetchMode) -> PyResult<Py<PyAny>> {
         self.validate(py)?;
         let shared = self.shared.clone();
-        let initsize = self.readvar_initsize.load(Ordering::Relaxed);
+        let ctx = self.fetch_ctx(py);
+        let converters: ConverterMap = self.connection.bind(py).borrow().converter_map();
+        let as_dicts = self.rows_as_dicts;
 
         dispatch_future(py, &self.tx, move |_state| {
             let (hstmt, colinfos) = {
@@ -245,7 +317,7 @@ impl Cursor {
                 }
                 let mut cells = Vec::with_capacity(colinfos.len());
                 for (i, info) in colinfos.iter().enumerate() {
-                    cells.push(getdata::get_data(hstmt, i, info, initsize, &on_err)?);
+                    cells.push(getdata::get_data(hstmt, i, info, &ctx, &on_err)?);
                 }
                 rows.push(cells);
             }
@@ -266,37 +338,65 @@ impl Cursor {
                     )
                 };
 
-                let mut py_rows = Vec::with_capacity(rows.len());
+                let cell_to_py = |py: Python<'_>, cell: CellValue| -> PyResult<Py<PyAny>> {
+                    match cell {
+                        CellValue::Converted { sql_type, data } => {
+                            call_converter(py, &converters, sql_type, data)
+                        }
+                        other => other.into_py(py),
+                    }
+                };
+
+                let mut py_rows: Vec<Py<PyAny>> = Vec::with_capacity(rows.len());
                 for cells in rows {
                     let values = cells
                         .into_iter()
-                        .map(|c| c.into_py(py))
+                        .map(|c| cell_to_py(py, c))
                         .collect::<PyResult<Vec<_>>>()?;
-                    py_rows.push(Py::new(
-                        py,
-                        Row {
-                            values,
-                            description: description.clone_ref(py),
-                            name_map: name_map.clone_ref(py),
-                        },
-                    )?);
+                    if as_dicts && !matches!(mode, FetchMode::Val | FetchMode::Skip(_)) {
+                        // Ticket #171: rows as dicts, keyed by column name from the
+                        // description.
+                        let d = PyDict::new(py);
+                        let desc = description.bind(py);
+                        for (i, value) in values.iter().enumerate() {
+                            let name = desc.get_item(i)?.get_item(0)?;
+                            d.set_item(name, value)?;
+                        }
+                        py_rows.push(d.into_any().unbind());
+                    } else {
+                        py_rows.push(
+                            Py::new(
+                                py,
+                                Row {
+                                    values,
+                                    description: description.clone_ref(py),
+                                    name_map: name_map.clone_ref(py),
+                                },
+                            )?
+                            .into_any(),
+                        );
+                    }
                 }
 
                 match mode {
                     FetchMode::One => Ok(match py_rows.into_iter().next() {
-                        Some(r) => r.into_any(),
+                        Some(r) => r,
                         None => py.None(),
                     }),
                     FetchMode::Next => match py_rows.into_iter().next() {
-                        Some(r) => Ok(r.into_any()),
+                        Some(r) => Ok(r),
                         None => Err(PyStopAsyncIteration::new_err(())),
                     },
                     FetchMode::Val => Ok(match py_rows.into_iter().next() {
                         Some(r) => {
-                            let row = r.borrow(py);
-                            match row.values.first() {
-                                Some(v) => v.clone_ref(py),
-                                None => py.None(),
+                            let row_ref = r.bind(py);
+                            if let Ok(row) = row_ref.downcast::<Row>() {
+                                match row.borrow().values.first() {
+                                    Some(v) => v.clone_ref(py),
+                                    None => py.None(),
+                                }
+                            } else {
+                                py.None()
                             }
                         }
                         None => py.None(),
@@ -332,6 +432,30 @@ impl Cursor {
         self.shared.lock().unwrap().rowcount
     }
 
+    /// Diagnostic messages from the last execute (e.g. PRINT output), or None.
+    #[getter]
+    fn messages(&self, py: Python<'_>) -> Py<PyAny> {
+        let guard = self.shared.lock().unwrap();
+        match guard.messages.as_ref() {
+            Some(m) => m.clone_ref(py),
+            None => py.None(),
+        }
+    }
+
+    /// The raw ODBC statement handle as ctypes.c_void_p, or None once closed.
+    #[getter]
+    fn hstmt(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.closed {
+            return Ok(py.None());
+        }
+        let value = self.shared.lock().unwrap().hstmt;
+        Ok(py
+            .import("ctypes")?
+            .getattr("c_void_p")?
+            .call1((value,))?
+            .unbind())
+    }
+
     #[pyo3(signature = (sql, *params))]
     fn execute(
         slf: &Bound<'_, Self>,
@@ -348,6 +472,13 @@ impl Cursor {
         sql: &str,
         param_rows: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        let unicode_enc = slf
+            .borrow()
+            .connection
+            .bind(py)
+            .borrow()
+            .encodings_snapshot()
+            .unicode;
         let mut rows = Vec::new();
         for row in param_rows.try_iter()? {
             let row = row?;
@@ -356,7 +487,7 @@ impl Cursor {
                     "Params must be in a list, tuple, or Row",
                 ));
             }
-            rows.push(extract_param_row(&row)?);
+            rows.push(extract_param_row(&row, &unicode_enc)?);
         }
         if rows.is_empty() {
             return Err(ProgrammingError::new_err(
@@ -392,11 +523,17 @@ impl Cursor {
         let this = slf.borrow();
         this.validate(py)?;
         let shared = this.shared.clone();
-        let lowercase: bool = py
-            .import("pyodbc")
-            .and_then(|m| m.getattr("lowercase"))
-            .and_then(|v| v.extract())
-            .unwrap_or(false);
+        let lowercase = module_flag(py, "lowercase");
+        let native_uuid = module_flag(py, "native_uuid");
+        let (metadata_enc, fetch_dec_str, byte_len, converter_types) = {
+            let conn = this.connection.bind(py).borrow();
+            (
+                conn.encodings_snapshot().metadata,
+                conn.fetch_decimal_as_string_value(),
+                conn.diagrec_byte_length(),
+                conn.converter_types(),
+            )
+        };
 
         dispatch_future(py, &this.tx, move |_state| {
             let hstmt = {
@@ -419,8 +556,13 @@ impl Cursor {
                     hstmt as Handle,
                 ));
             }
+            let diags = if ret == SqlReturn::SUCCESS_WITH_INFO {
+                collect_diag(hstmt, &metadata_enc, byte_len)
+            } else {
+                Vec::new()
+            };
 
-            let raw_cols = describe_columns(hstmt)?;
+            let raw_cols = describe_columns(hstmt, &metadata_enc, fetch_dec_str)?;
             {
                 let mut guard = shared.lock().unwrap();
                 guard.colinfos = raw_cols
@@ -428,15 +570,19 @@ impl Cursor {
                     .map(|c| ColInfo {
                         sql_type: c.sql_type,
                         column_size: c.column_size,
+                        use_decimal_binary: c.use_decimal_binary,
                     })
                     .collect();
             }
 
             Ok(Box::new(move |py: Python<'_>| {
-                let (description, name_map) = build_description(py, &raw_cols, lowercase)?;
+                let (description, name_map) =
+                    build_description(py, &raw_cols, lowercase, native_uuid, &converter_types)?;
+                let messages = build_messages(py, diags)?;
                 let mut guard = shared.lock().unwrap();
                 guard.description = description;
                 guard.name_map = name_map;
+                guard.messages = Some(messages);
                 drop(guard);
                 Ok(true.into_pyobject(py)?.to_owned().into_any().unbind())
             }) as Finisher)
@@ -529,6 +675,28 @@ impl Cursor {
     }
 }
 
+/// Invoke a registered output converter (GIL held).  NULL values become None
+/// without calling the converter (GetDataUser in getdata.cpp).
+fn call_converter(
+    py: Python<'_>,
+    converters: &ConverterMap,
+    sql_type: i16,
+    data: Option<Vec<u8>>,
+) -> PyResult<Py<PyAny>> {
+    let Some(bytes) = data else {
+        return Ok(py.None());
+    };
+    let func = {
+        let map = converters.lock().unwrap();
+        map.get(&(sql_type as i32)).map(|f| f.clone_ref(py))
+    };
+    match func {
+        Some(f) => Ok(f.bind(py).call1((PyBytes::new(py, &bytes),))?.unbind()),
+        // The converter was removed between fetch and conversion; return bytes.
+        None => Ok(PyBytes::new(py, &bytes).into_any().unbind()),
+    }
+}
+
 /// Allocate the statement handle on first use.  Runs on the worker.
 fn ensure_hstmt(
     state: &crate::worker::ConnState,
@@ -560,7 +728,96 @@ fn free_results(hstmt: HStmt) {
     }
 }
 
-fn describe_columns(hstmt: HStmt) -> PyResult<Vec<RawCol>> {
+/// Read all diagnostic records for Cursor.messages (GetDiagRecs in cursor.cpp).
+fn collect_diag(hstmt: HStmt, metadata_enc: &TextEnc, byte_len: bool) -> Vec<RawDiag> {
+    let mut out = Vec::new();
+    let mut record: i16 = 1;
+    loop {
+        let mut state_buf = [0u16; 6];
+        let mut native: i32 = 0;
+        let mut cch: i16 = 0;
+        let mut buf = vec![0u16; 1024];
+
+        let mut ret = unsafe {
+            odbc_sys::SQLGetDiagRecW(
+                HandleType::Stmt,
+                hstmt as Handle,
+                record,
+                state_buf.as_mut_ptr(),
+                &mut native,
+                buf.as_mut_ptr(),
+                (buf.len() - 1) as i16,
+                &mut cch,
+            )
+        };
+        if !succeeded(ret) {
+            break;
+        }
+        if byte_len {
+            cch /= 2;
+        }
+        if cch as usize > buf.len() - 1 {
+            buf = vec![0u16; cch as usize + 2];
+            ret = unsafe {
+                odbc_sys::SQLGetDiagRecW(
+                    HandleType::Stmt,
+                    hstmt as Handle,
+                    record,
+                    state_buf.as_mut_ptr(),
+                    &mut native,
+                    buf.as_mut_ptr(),
+                    (buf.len() - 1) as i16,
+                    &mut cch,
+                )
+            };
+            if !succeeded(ret) {
+                break;
+            }
+            if byte_len {
+                cch /= 2;
+            }
+        }
+
+        let state = String::from_utf16_lossy(&state_buf[..5])
+            .trim_end_matches('\0')
+            .to_string();
+        let raw: Vec<u8> = buf[..(cch.max(0) as usize).min(buf.len())]
+            .iter()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
+        let text = match textenc::decode(&raw, metadata_enc) {
+            Ok(d) => MsgText::Decoded(d),
+            Err(_) => MsgText::Raw(raw),
+        };
+        out.push(RawDiag {
+            state,
+            native,
+            text,
+        });
+        record += 1;
+    }
+    out
+}
+
+/// Build the Python list for Cursor.messages (GIL held).
+fn build_messages(py: Python<'_>, diags: Vec<RawDiag>) -> PyResult<Py<PyAny>> {
+    let list = PyList::empty(py);
+    for d in diags {
+        let class = format!("[{}] ({})", d.state, d.native);
+        let value = match d.text {
+            MsgText::Decoded(t) => t.into_py_or_bytes(py)?,
+            MsgText::Raw(b) => PyBytes::new(py, &b).into_any().unbind(),
+        };
+        list.append((class, value))?;
+    }
+    Ok(list.into_any().unbind())
+}
+
+fn describe_columns(
+    hstmt: HStmt,
+    metadata_enc: &TextEnc,
+    fetch_decimal_as_string: bool,
+) -> PyResult<Vec<RawCol>> {
     let on_err = |func: &'static str| error_from_handle(func, HandleType::Stmt, hstmt as Handle);
 
     let mut col_count: i16 = 0;
@@ -602,25 +859,81 @@ fn describe_columns(hstmt: HStmt) -> PyResult<Vec<RawCol>> {
             break;
         }
 
-        let name = String::from_utf16_lossy(&name_buf[..name_len.max(0) as usize]);
+        // The name buffer holds SQLWCHAR data; interpret it per the metadata
+        // encoding (create_name_map in cursor.cpp).  The byte count is the
+        // character count times the element size of the configured C type.
+        let cb = (name_len.max(0) as usize) * if metadata_enc.wide { 2 } else { 1 };
+        let raw: Vec<u8> = name_buf
+            .iter()
+            .flat_map(|u| u.to_ne_bytes())
+            .take(cb)
+            .collect();
+        let name = textenc::decode(&raw, metadata_enc)?;
+
+        // For DECIMAL/NUMERIC columns, configure the ARD once so SQLGetData can
+        // fill a SQL_NUMERIC_STRUCT with the right precision/scale.
+        let mut use_decimal_binary = false;
+        if matches!(data_type.0, 2 | 3)  // SQL_NUMERIC | SQL_DECIMAL
+            && !fetch_decimal_as_string
+            && (0..=127).contains(&decimal_digits)
+        {
+            let mut hdesc: HDesc = std::ptr::null_mut();
+            let ret = unsafe {
+                odbc_sys::SQLGetStmtAttr(
+                    hstmt,
+                    StatementAttribute::AppRowDesc,
+                    &mut hdesc as *mut HDesc as Pointer,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if succeeded(ret) {
+                let ok = unsafe {
+                    succeeded(odbc_sys::SQLSetDescField(
+                        hdesc,
+                        (i + 1) as i16,
+                        Desc::Type,
+                        SQL_C_NUMERIC as Pointer,
+                        0,
+                    )) && succeeded(odbc_sys::SQLSetDescField(
+                        hdesc,
+                        (i + 1) as i16,
+                        Desc::Precision,
+                        column_size as Pointer,
+                        0,
+                    )) && succeeded(odbc_sys::SQLSetDescField(
+                        hdesc,
+                        (i + 1) as i16,
+                        Desc::Scale,
+                        decimal_digits as usize as Pointer,
+                        0,
+                    ))
+                };
+                use_decimal_binary = ok;
+            }
+        }
+
         cols.push(RawCol {
             name,
             sql_type: data_type.0,
             column_size: column_size as u64,
             decimal_digits,
             nullable,
+            use_decimal_binary,
         });
     }
     Ok(cols)
 }
 
-/// Build the DB API description tuple and the shared name->index map.  GIL held.
 type DescriptionAndMap = (Option<Py<PyAny>>, Option<Py<PyDict>>);
 
+/// Build the DB API description tuple and the shared name->index map.  GIL held.
 fn build_description(
     py: Python<'_>,
     raw_cols: &[RawCol],
     lowercase: bool,
+    native_uuid: bool,
+    converter_types: &[i32],
 ) -> PyResult<DescriptionAndMap> {
     if raw_cols.is_empty() {
         return Ok((None, None));
@@ -628,19 +941,27 @@ fn build_description(
     let map = PyDict::new(py);
     let mut items = Vec::with_capacity(raw_cols.len());
     for (i, col) in raw_cols.iter().enumerate() {
-        let name = if lowercase {
-            col.name.to_lowercase()
-        } else {
-            col.name.clone()
+        let name_obj = match &col.name {
+            DecodedText::Native(s) => s.clone().into_pyobject(py)?.into_any(),
+            DecodedText::Codec(bytes, codec) => py.import("codecs")?.call_method1(
+                "decode",
+                (PyBytes::new(py, bytes), codec.as_str(), "strict"),
+            )?,
         };
-        let type_obj = getdata::python_type_for_sql_type(py, col.sql_type)?;
+        let name_obj = if lowercase {
+            name_obj.call_method0("lower")?
+        } else {
+            name_obj
+        };
+        let has_conv = converter_types.contains(&(col.sql_type as i32));
+        let type_obj = getdata::python_type_for_sql_type(py, col.sql_type, native_uuid, has_conv)?;
         let nullable: Py<PyAny> = match col.nullable {
             Nullability::NO_NULLS => false.into_pyobject(py)?.to_owned().into_any().unbind(),
             Nullability::NULLABLE => true.into_pyobject(py)?.to_owned().into_any().unbind(),
             _ => py.None(),
         };
         let info = (
-            name.clone(),
+            &name_obj,
             type_obj,
             py.None(),
             col.column_size,
@@ -649,61 +970,148 @@ fn build_description(
             nullable,
         )
             .into_pyobject(py)?;
-        map.set_item(name, i)?;
+        map.set_item(&name_obj, i)?;
         items.push(info);
     }
     let desc = PyTuple::new(py, items)?;
     Ok((Some(desc.into_any().unbind()), Some(map.unbind())))
 }
 
-/// Prepare/bind/execute on the worker.  Returns (rowcount, columns).
-fn execute_odbc(hstmt: HStmt, sql_w: &[u16], rows: ExecuteRows) -> PyResult<(i64, Vec<RawCol>)> {
-    let on_err = |func: &'static str| error_from_handle(func, HandleType::Stmt, hstmt as Handle);
+/// Prepare/bind/execute on the worker.  Returns (rowcount, columns, diagnostics).
+fn execute_odbc(
+    hstmt: HStmt,
+    ctx: &ExecCtx,
+    rows: ExecuteRows,
+    need_long_data_len: bool,
+) -> PyResult<(i64, Vec<RawCol>, Vec<RawDiag>)> {
+    let on_err = |func: &'static str| {
+        error_from_handle_ex(func, HandleType::Stmt, hstmt as Handle, ctx.byte_len_diag)
+    };
 
+    let exec_prepared = |bound: &[BoundParam]| -> PyResult<SqlReturn> {
+        let mut ret = unsafe { odbc_sys::SQLExecute(hstmt) };
+
+        // One or more parameters were bound as data-at-execution: stream them via
+        // SQLParamData/SQLPutData (cursor.cpp execute).
+        while ret == SqlReturn::NEED_DATA {
+            let mut token: Pointer = std::ptr::null_mut();
+            ret = unsafe { odbc_sys::SQLParamData(hstmt, &mut token) };
+            if ret == SqlReturn::NEED_DATA {
+                let index = (token as usize).wrapping_sub(1);
+                let data = bound
+                    .get(index)
+                    .filter(|b| b.is_dae())
+                    .map(|b| b.dae_bytes())
+                    .ok_or_else(|| {
+                        ProgrammingError::new_err("driver requested data for an unknown parameter")
+                    })?;
+                let chunk = if ctx.maxwrite > 0 {
+                    ctx.maxwrite
+                } else {
+                    data.len().max(1)
+                };
+                let mut offset = 0usize;
+                loop {
+                    let remaining = chunk.min(data.len() - offset);
+                    let put = unsafe {
+                        odbc_sys::SQLPutData(
+                            hstmt,
+                            data[offset..].as_ptr() as Pointer,
+                            remaining as Len,
+                        )
+                    };
+                    if !succeeded(put) {
+                        return Err(on_err("SQLPutData"));
+                    }
+                    offset += remaining;
+                    if offset >= data.len() {
+                        break;
+                    }
+                }
+            } else if ret != SqlReturn::NO_DATA && !succeeded(ret) {
+                return Err(on_err("SQLParamData"));
+            }
+        }
+        Ok(ret)
+    };
+
+    let mut with_info = false;
     match rows {
         ExecuteRows::One(values) if values.is_empty() => {
-            let ret =
-                unsafe { odbc_sys::SQLExecDirectW(hstmt, sql_w.as_ptr(), sql_w.len() as i32) };
+            let ret = if ctx.sql_wide {
+                unsafe {
+                    odbc_sys::SQLExecDirectW(
+                        hstmt,
+                        ctx.sql_bytes.as_ptr() as *const u16,
+                        (ctx.sql_bytes.len() / 2) as i32,
+                    )
+                }
+            } else {
+                unsafe {
+                    odbc_sys::SQLExecDirect(
+                        hstmt,
+                        ctx.sql_bytes.as_ptr(),
+                        ctx.sql_bytes.len() as i32,
+                    )
+                }
+            };
             if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                 return Err(on_err("SQLExecDirectW"));
             }
+            with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
         }
         ExecuteRows::One(values) => {
-            let ret = unsafe { odbc_sys::SQLPrepareW(hstmt, sql_w.as_ptr(), sql_w.len() as i32) };
-            if !succeeded(ret) {
-                return Err(on_err("SQLPrepare"));
-            }
+            prepare(hstmt, ctx, &on_err)?;
             let mut bound: Vec<BoundParam> = Vec::with_capacity(values.len());
             for (i, value) in values.into_iter().enumerate() {
-                bound.push(params::bind(hstmt, i, value, on_err)?);
+                bound.push(params::bind(
+                    hstmt,
+                    i,
+                    value,
+                    ctx.maxwrite,
+                    need_long_data_len,
+                    on_err,
+                )?);
             }
-            let ret = unsafe { odbc_sys::SQLExecute(hstmt) };
+            let ret = exec_prepared(&bound)?;
             if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                 return Err(on_err("SQLExecute"));
             }
-            drop(bound); // buffers must outlive SQLExecute
+            with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
+            drop(bound); // buffers must outlive SQLExecute and the SQLPutData loop
         }
         ExecuteRows::Many(param_rows) => {
-            let ret = unsafe { odbc_sys::SQLPrepareW(hstmt, sql_w.as_ptr(), sql_w.len() as i32) };
-            if !succeeded(ret) {
-                return Err(on_err("SQLPrepare"));
-            }
+            prepare(hstmt, ctx, &on_err)?;
             for values in param_rows {
                 unsafe {
                     let _ = odbc_sys::SQLFreeStmt(hstmt, FreeStmtOption::ResetParams);
                 }
                 let mut bound: Vec<BoundParam> = Vec::with_capacity(values.len());
                 for (i, value) in values.into_iter().enumerate() {
-                    bound.push(params::bind(hstmt, i, value, on_err)?);
+                    bound.push(params::bind(
+                        hstmt,
+                        i,
+                        value,
+                        ctx.maxwrite,
+                        need_long_data_len,
+                        on_err,
+                    )?);
                 }
-                let ret = unsafe { odbc_sys::SQLExecute(hstmt) };
+                let ret = exec_prepared(&bound)?;
                 if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                     return Err(on_err("SQLExecute"));
                 }
+                with_info = with_info || ret == SqlReturn::SUCCESS_WITH_INFO;
                 drop(bound);
             }
         }
     }
+
+    let diags = if with_info {
+        collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag)
+    } else {
+        Vec::new()
+    };
 
     let mut rowcount: Len = 0;
     let ret = unsafe { odbc_sys::SQLRowCount(hstmt, &mut rowcount) };
@@ -711,6 +1119,24 @@ fn execute_odbc(hstmt: HStmt, sql_w: &[u16], rows: ExecuteRows) -> PyResult<(i64
         return Err(on_err("SQLRowCount"));
     }
 
-    let cols = describe_columns(hstmt)?;
-    Ok((rowcount as i64, cols))
+    let cols = describe_columns(hstmt, &ctx.metadata_enc, ctx.fetch_decimal_as_string)?;
+    Ok((rowcount as i64, cols, diags))
+}
+
+fn prepare(hstmt: HStmt, ctx: &ExecCtx, on_err: &impl Fn(&'static str) -> PyErr) -> PyResult<()> {
+    let ret = if ctx.sql_wide {
+        unsafe {
+            odbc_sys::SQLPrepareW(
+                hstmt,
+                ctx.sql_bytes.as_ptr() as *const u16,
+                (ctx.sql_bytes.len() / 2) as i32,
+            )
+        }
+    } else {
+        unsafe { odbc_sys::SQLPrepare(hstmt, ctx.sql_bytes.as_ptr(), ctx.sql_bytes.len() as i32) }
+    };
+    if !succeeded(ret) {
+        return Err(on_err("SQLPrepare"));
+    }
+    Ok(())
 }

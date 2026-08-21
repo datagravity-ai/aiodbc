@@ -1,7 +1,8 @@
 // Binding Python parameter values into SQL statements.  Ported (simplified) from
-// src/params.cpp: this Phase-1 version covers the scalar types the test suites bind
-// most; decimals, UUIDs, DAE/streaming writes and fast_executemany come in later
-// phases (see docs/rust-asyncio-rewrite-plan.md).
+// src/params.cpp.  Covers the scalar types plus Decimal and UUID; strings are
+// encoded per the connection's unicode write encoding, and values longer than
+// Connection.maxwrite are bound as data-at-execution (streamed via SQLPutData).
+// TVPs and fast_executemany come with phase 4.
 
 use odbc_sys::{
     CDataType, HStmt, Len, Nullability, ParamType, Pointer, SqlDataType, SqlReturn, ULen,
@@ -11,7 +12,13 @@ use pyo3::types::{
     PyBool, PyByteArray, PyBytes, PyDate, PyDateTime, PyFloat, PyInt, PyString, PyTime,
 };
 
+use crate::decimal_support;
 use crate::errors::ProgrammingError;
+use crate::textenc::{self, TextEnc};
+
+// SQL_DATA_AT_EXEC / SQL_LEN_DATA_AT_EXEC(length) from sqlext.h.
+const SQL_DATA_AT_EXEC: Len = -2;
+const SQL_LEN_DATA_AT_EXEC_OFFSET: Len = -100;
 
 /// A parameter value extracted from Python, safe to move to the worker thread.
 pub enum ParamValue {
@@ -20,9 +27,21 @@ pub enum ParamValue {
     I32(i32),
     I64(i64),
     F64(f64),
-    /// UTF-16, matching the default unicode write encoding (SQL_C_WCHAR).
-    Str(Vec<u16>),
+    /// Encoded per the connection's unicode write encoding.
+    Text {
+        bytes: Vec<u8>,
+        wide: bool,
+        /// ColumnSize, in characters.
+        chars: usize,
+    },
     Bytes(Vec<u8>),
+    Decimal {
+        /// Plain "-123.45"-style string, always '.'-separated.
+        text: String,
+        precision: u64,
+        scale: i16,
+    },
+    Uuid([u8; 16]), // bytes_le, matching the SQLGUID memory layout
     Date(odbc_sys::Date),
     Time(odbc_sys::Time),
     DateTime(odbc_sys::Timestamp),
@@ -37,8 +56,13 @@ fn invalid_type_err(index: usize, type_name: &str) -> PyErr {
 }
 
 /// Extract one parameter cell.  The type-check order mirrors GetParameterInfo in
-/// params.cpp (bool before int, datetime before date).
-pub fn extract(cell: &Bound<'_, PyAny>, index: usize) -> PyResult<ParamValue> {
+/// params.cpp (bool before int, datetime before date).  Runs under the GIL.
+pub fn extract(
+    cell: &Bound<'_, PyAny>,
+    index: usize,
+    unicode_enc: &TextEnc,
+) -> PyResult<ParamValue> {
+    let py = cell.py();
     if cell.is_none() {
         return Ok(ParamValue::Null);
     }
@@ -58,7 +82,13 @@ pub fn extract(cell: &Bound<'_, PyAny>, index: usize) -> PyResult<ParamValue> {
     }
     if cell.is_instance_of::<PyString>() {
         let s: String = cell.extract()?;
-        return Ok(ParamValue::Str(s.encode_utf16().collect()));
+        let bytes = textenc::encode(py, &s, unicode_enc)?;
+        let chars = (bytes.len() / textenc::column_size_denominator(unicode_enc)).max(1);
+        return Ok(ParamValue::Text {
+            bytes,
+            wide: unicode_enc.wide,
+            chars,
+        });
     }
     if cell.is_instance_of::<PyBytes>() || cell.is_instance_of::<PyByteArray>() {
         return Ok(ParamValue::Bytes(cell.extract()?));
@@ -89,6 +119,22 @@ pub fn extract(cell: &Bound<'_, PyAny>, index: usize) -> PyResult<ParamValue> {
             second: cell.getattr("second")?.extract()?,
         }));
     }
+    let decimal_cls = py.import("decimal")?.getattr("Decimal")?;
+    if cell.is_instance(&decimal_cls)? {
+        let (text, precision, scale) = decimal_support::decimal_param(cell)?;
+        return Ok(ParamValue::Decimal {
+            text,
+            precision,
+            scale,
+        });
+    }
+    let uuid_cls = py.import("uuid")?.getattr("UUID")?;
+    if cell.is_instance(&uuid_cls)? {
+        let bytes_le: Vec<u8> = cell.getattr("bytes_le")?.extract()?;
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&bytes_le);
+        return Ok(ParamValue::Uuid(buf));
+    }
     Err(invalid_type_err(index, cell.get_type().name()?.to_str()?))
 }
 
@@ -99,6 +145,24 @@ pub fn extract(cell: &Bound<'_, PyAny>, index: usize) -> PyResult<ParamValue> {
 pub struct BoundParam {
     _value: Box<ParamValue>,
     indicator: Box<Len>,
+    /// Set when the value is bound as data-at-execution; SQLPutData streams it in
+    /// chunks of `chunk` bytes after SQLExecute returns SQL_NEED_DATA.
+    dae: bool,
+}
+
+impl BoundParam {
+    pub fn is_dae(&self) -> bool {
+        self.dae
+    }
+
+    /// The raw bytes to stream for a DAE parameter.
+    pub fn dae_bytes(&self) -> &[u8] {
+        match &*self._value {
+            ParamValue::Text { bytes, .. } => bytes,
+            ParamValue::Bytes(b) => b,
+            _ => &[],
+        }
+    }
 }
 
 fn describe_param_type(hstmt: HStmt, index: usize) -> SqlDataType {
@@ -129,16 +193,20 @@ fn describe_param_type(hstmt: HStmt, index: usize) -> SqlDataType {
 }
 
 /// Bind one parameter (1-based position = index + 1).  Runs on the worker thread.
-/// Returns the BoundParam whose buffers must outlive SQLExecute.
+/// Returns the BoundParam whose buffers must outlive SQLExecute (and the SQLPutData
+/// loop for DAE parameters).
 pub fn bind(
     hstmt: HStmt,
     index: usize,
     value: ParamValue,
+    maxwrite: usize,
+    need_long_data_len: bool,
     on_error: impl Fn(&'static str) -> PyErr,
 ) -> PyResult<BoundParam> {
     let mut bound = BoundParam {
         _value: Box::new(value),
         indicator: Box::new(0),
+        dae: false,
     };
 
     struct BindArgs {
@@ -151,6 +219,18 @@ pub fn bind(
         indicator: Len,
     }
 
+    // Values longer than maxwrite (when set) are provided at execution time via
+    // SQLPutData; the "pointer" becomes a token SQLParamData hands back (we use the
+    // 1-based parameter number).
+    let dae_indicator = |cb: Len| -> Len {
+        if need_long_data_len {
+            SQL_LEN_DATA_AT_EXEC_OFFSET - cb // SQL_LEN_DATA_AT_EXEC(cb)
+        } else {
+            SQL_DATA_AT_EXEC
+        }
+    };
+
+    let mut is_dae = false;
     let args = match &*bound._value {
         ParamValue::Null => BindArgs {
             ctype: CDataType::Default,
@@ -197,26 +277,91 @@ pub fn bind(
             buffer_len: 8,
             indicator: 8,
         },
-        ParamValue::Str(v) => {
-            let cb = (v.len() * 2) as Len; // bytes
-            BindArgs {
-                ctype: CDataType::WChar,
-                sqltype: SqlDataType::EXT_W_VARCHAR,
-                column_size: v.len().max(1) as ULen, // characters
-                decimal_digits: 0,
-                ptr: v.as_ptr() as Pointer,
-                buffer_len: cb,
-                indicator: cb,
+        ParamValue::Text { bytes, wide, chars } => {
+            let cb = bytes.len() as Len;
+            let (ctype, varchar, longvarchar) = if *wide {
+                (
+                    CDataType::WChar,
+                    SqlDataType::EXT_W_VARCHAR,
+                    SqlDataType::EXT_W_LONG_VARCHAR,
+                )
+            } else {
+                (
+                    CDataType::Char,
+                    SqlDataType::VARCHAR,
+                    SqlDataType::EXT_LONG_VARCHAR,
+                )
+            };
+            if maxwrite != 0 && bytes.len() > maxwrite {
+                is_dae = true;
+                BindArgs {
+                    ctype,
+                    sqltype: longvarchar,
+                    column_size: (*chars).max(1) as ULen,
+                    decimal_digits: 0,
+                    ptr: (index + 1) as Pointer,
+                    buffer_len: 0,
+                    indicator: dae_indicator(cb),
+                }
+            } else {
+                BindArgs {
+                    ctype,
+                    sqltype: varchar,
+                    column_size: (*chars).max(1) as ULen,
+                    decimal_digits: 0,
+                    ptr: bytes.as_ptr() as Pointer,
+                    buffer_len: cb,
+                    indicator: cb,
+                }
             }
         }
-        ParamValue::Bytes(v) => BindArgs {
-            ctype: CDataType::Binary,
-            sqltype: SqlDataType::EXT_VAR_BINARY,
-            column_size: v.len().max(1) as ULen,
+        ParamValue::Bytes(v) => {
+            if maxwrite != 0 && v.len() > maxwrite {
+                is_dae = true;
+                BindArgs {
+                    ctype: CDataType::Binary,
+                    sqltype: SqlDataType::EXT_LONG_VAR_BINARY,
+                    column_size: v.len().max(1) as ULen,
+                    decimal_digits: 0,
+                    ptr: (index + 1) as Pointer,
+                    buffer_len: 0,
+                    indicator: dae_indicator(v.len() as Len),
+                }
+            } else {
+                BindArgs {
+                    ctype: CDataType::Binary,
+                    sqltype: SqlDataType::EXT_VAR_BINARY,
+                    column_size: v.len().max(1) as ULen,
+                    decimal_digits: 0,
+                    ptr: v.as_ptr() as Pointer,
+                    buffer_len: v.len() as Len,
+                    indicator: v.len() as Len,
+                }
+            }
+        }
+        ParamValue::Decimal {
+            text,
+            precision,
+            scale,
+        } => BindArgs {
+            // Bound as a string: SQL_NUMERIC_STRUCT input is unreliable across
+            // drivers (params.cpp GetDecimalInfo).
+            ctype: CDataType::Char,
+            sqltype: SqlDataType::NUMERIC,
+            column_size: *precision as ULen,
+            decimal_digits: *scale,
+            ptr: text.as_ptr() as Pointer,
+            buffer_len: text.len() as Len,
+            indicator: text.len() as Len,
+        },
+        ParamValue::Uuid(v) => BindArgs {
+            ctype: CDataType::Guid,
+            sqltype: SqlDataType::EXT_GUID,
+            column_size: 16,
             decimal_digits: 0,
             ptr: v.as_ptr() as Pointer,
-            buffer_len: v.len() as Len,
-            indicator: v.len() as Len,
+            buffer_len: 16,
+            indicator: 16,
         },
         ParamValue::Date(v) => BindArgs {
             ctype: CDataType::TypeDate,
@@ -249,6 +394,7 @@ pub fn bind(
         },
     };
 
+    bound.dae = is_dae;
     *bound.indicator = args.indicator;
 
     let ret = unsafe {
