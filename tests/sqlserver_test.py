@@ -1,6 +1,7 @@
 # ignore naive dates/datetimes (DTZnnn):
 # ruff: noqa: DTZ001, DTZ005, DTZ011
 
+import asyncio
 import ctypes
 import gc
 import os
@@ -29,17 +30,21 @@ import pytest
 CNXNSTR = os.environ.get('PYODBC_SQLSERVER', 'DSN=pyodbc-sqlserver')
 
 
-def connect(autocommit=False, attrs_before=None):
-    return pyodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
+async def connect(autocommit=False, attrs_before=None):
+    return await pyodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
 
 
-DRIVER = connect().getinfo(pyodbc.SQL_DRIVER_NAME)
-DRIVER_VERSION = tuple(int(n) for n in connect().getinfo(pyodbc.SQL_DRIVER_VER).split("."))
+async def _module_getinfo(info):
+    return await (await connect()).getinfo(info)
+
+DRIVER = asyncio.run(_module_getinfo(pyodbc.SQL_DRIVER_NAME))
+DRIVER_VERSION = tuple(
+    int(n) for n in asyncio.run(_module_getinfo(pyodbc.SQL_DRIVER_VER)).split("."))
 IS_FREETDS   = bool(re.search(r'(tsodbc|tdsodbc)', DRIVER, flags=re.IGNORECASE))
 IS_MSODBCSQL = bool(re.search(r'(msodbcsql|sqlncli|sqlsrv32\.dll)', DRIVER, re.IGNORECASE))
 
 
-def _get_sqlserver_year():
+async def _get_sqlserver_year():
     """
     Returns the release year of the current version of SQL Server, used to skip tests for
     features that are not supported.  If the current DB is not SQL Server, 0 is returned.
@@ -48,9 +53,9 @@ def _get_sqlserver_year():
     # (e.g. SQL Server 2019) so we'll use that for skipping tests that do not apply.
     if not IS_MSODBCSQL:
         return 0
-    cnxn = connect()
+    cnxn = await connect()
     cursor = cnxn.cursor()
-    row = cursor.execute("exec master..xp_msver 'ProductVersion'").fetchone()
+    row = await (await cursor.execute("exec master..xp_msver 'ProductVersion'")).fetchone()
     major = row.Character_Value.split('.', 1)[0]
     return {
         # https://sqlserverbuilds.blogspot.com/
@@ -59,92 +64,92 @@ def _get_sqlserver_year():
     }[major]
 
 
-SQLSERVER_YEAR = _get_sqlserver_year()
+SQLSERVER_YEAR = asyncio.run(_get_sqlserver_year())
 
 
 @pytest.fixture
-def cursor() -> Iterator[pyodbc.Cursor]:
-    cnxn = connect()
+async def cursor() -> Iterator[pyodbc.Cursor]:
+    cnxn = await connect()
     cur = cnxn.cursor()
 
-    cur.execute("drop table if exists t1")
-    cur.execute("drop table if exists t2")
-    cur.execute("drop table if exists t3")
-    cnxn.commit()
+    await cur.execute("drop table if exists t1")
+    await cur.execute("drop table if exists t2")
+    await cur.execute("drop table if exists t3")
+    await cnxn.commit()
 
     yield cur
 
     if not cnxn.closed:
-        cur.close()
-        cnxn.close()
+        await cur.close()
+        await cnxn.close()
 
 
-def test_text(cursor: pyodbc.Cursor):
-    _test_vartype(cursor, 'text')
+async def test_text(cursor: pyodbc.Cursor):
+    await _test_vartype(cursor, 'text')
 
 
-def test_varchar(cursor: pyodbc.Cursor):
-    _test_vartype(cursor, 'varchar')
+async def test_varchar(cursor: pyodbc.Cursor):
+    await _test_vartype(cursor, 'varchar')
 
 
-def test_nvarchar(cursor: pyodbc.Cursor):
-    _test_vartype(cursor, 'nvarchar')
+async def test_nvarchar(cursor: pyodbc.Cursor):
+    await _test_vartype(cursor, 'nvarchar')
 
 
-def test_varbinary(cursor: pyodbc.Cursor):
-    _test_vartype(cursor, 'varbinary')
+async def test_varbinary(cursor: pyodbc.Cursor):
+    await _test_vartype(cursor, 'varbinary')
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2005, reason='(max) not supported until 2005')
-def test_unicode_longmax(cursor: pyodbc.Cursor):
+async def test_unicode_longmax(cursor: pyodbc.Cursor):
     # Issue 188:	Segfault when fetching NVARCHAR(MAX) data over 511 bytes
-    cursor.execute("select cast(replicate(N'x', 512) as nvarchar(max))")
+    await cursor.execute("select cast(replicate(N'x', 512) as nvarchar(max))")
 
 
-def test_char(cursor: pyodbc.Cursor):
+async def test_char(cursor: pyodbc.Cursor):
     value = "testing"
-    cursor.execute("create table t1(s char(7))")
-    cursor.execute("insert into t1 values(?)", "testing")
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s char(7))")
+    await cursor.execute("insert into t1 values(?)", "testing")
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert v == value
 
 
-def test_int(cursor: pyodbc.Cursor):
-    _test_scalar(cursor, 'int', [None, -1, 0, 1, 12345678])
+async def test_int(cursor: pyodbc.Cursor):
+    await _test_scalar(cursor, 'int', [None, -1, 0, 1, 12345678])
 
 
-def test_bigint(cursor: pyodbc.Cursor):
-    _test_scalar(cursor, 'bigint', [None, -1, 0, 1, 0x123456789, 0x7FFFFFFF, 0xFFFFFFFF,
-                                    0x123456789])
+async def test_bigint(cursor: pyodbc.Cursor):
+    await _test_scalar(cursor, 'bigint', [None, -1, 0, 1, 0x123456789, 0x7FFFFFFF,
+                                          0xFFFFFFFF, 0x123456789])
 
 
-def test_overflow_int(cursor: pyodbc.Cursor):
+async def test_overflow_int(cursor: pyodbc.Cursor):
     # python allows integers of any size, bigger than an 8 byte int can contain
     value = 9999999999999999999999999999999999999
-    cursor.execute("create table t1(d bigint)")
+    await cursor.execute("create table t1(d bigint)")
     with pytest.raises(OverflowError):
-        cursor.execute("insert into t1 values (?)", value)
-    result = cursor.execute("select * from t1").fetchall()
+        await cursor.execute("insert into t1 values (?)", value)
+    result = await (await cursor.execute("select * from t1")).fetchall()
     assert result == []
 
 
-def test_float(cursor: pyodbc.Cursor):
-    _test_scalar(cursor, 'float', [None, -200, -1, 0, 1, 1234.5, -200, .00012345])
+async def test_float(cursor: pyodbc.Cursor):
+    await _test_scalar(cursor, 'float', [None, -200, -1, 0, 1, 1234.5, -200, .00012345])
 
 
-def test_non_numeric_float(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(d float)")
+async def test_non_numeric_float(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(d float)")
     for value in (float('+Infinity'), float('-Infinity'), float('NaN')):
         with pytest.raises(pyodbc.ProgrammingError):
-            cursor.execute("insert into t1 values (?)", value)
+            await cursor.execute("insert into t1 values (?)", value)
     if IS_FREETDS:
         # Give the driver a chance to unconfuse itself. Without creating and closing
         # this second connection, this test will pass, but the next test in the queue
         # depending on the cursor-generator fixture will fail when that fixture tries
         # to commit the "DROP TABLE IF EXISTS…" statements, triggering an exception.
         # For details refer to https://github.com/FreeTDS/freetds/issues/718.
-        conn2 = connect()
-        conn2.close()
+        conn2 = await connect()
+        await conn2.close()
 
 
 def test_drivers():
@@ -157,81 +162,81 @@ def test_datasources():
     assert isinstance(p, dict)
 
 
-def test_getinfo_string():
-    cnxn = connect()
-    value = cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
+async def test_getinfo_string():
+    cnxn = await connect()
+    value = await cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
     assert isinstance(value, str)
 
 
-def test_getinfo_bool():
-    cnxn = connect()
-    value = cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
+async def test_getinfo_bool():
+    cnxn = await connect()
+    value = await cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
     assert isinstance(value, bool)
 
 
-def test_getinfo_int():
-    cnxn = connect()
-    value = cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
+async def test_getinfo_int():
+    cnxn = await connect()
+    value = await cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
     assert isinstance(value, int)
 
 
-def test_getinfo_smallint():
-    cnxn = connect()
-    value = cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
+async def test_getinfo_smallint():
+    cnxn = await connect()
+    value = await cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
     assert isinstance(value, int)
 
 
-def test_no_fetch(cursor: pyodbc.Cursor):
+async def test_no_fetch(cursor: pyodbc.Cursor):
     # Issue 89 with FreeTDS: Multiple selects (or catalog functions that issue selects) without
     # fetches seem to confuse the driver.
-    cursor.execute('select 1')
-    cursor.execute('select 1')
-    cursor.execute('select 1')
+    await cursor.execute('select 1')
+    await cursor.execute('select 1')
+    await cursor.execute('select 1')
 
 
-def test_decode_meta(cursor: pyodbc.Cursor):
+async def test_decode_meta(cursor: pyodbc.Cursor):
     """
     Ensure column names with non-ASCII characters are converted using the configured encodings.
     """
     # This is from GitHub issue #190
-    cursor.execute("create table t1(a int)")
-    cursor.execute("insert into t1 values (1)")
-    cursor.execute('select a as "Tipología" from t1')
+    await cursor.execute("create table t1(a int)")
+    await cursor.execute("insert into t1 values (1)")
+    await cursor.execute('select a as "Tipología" from t1')
     assert cursor.description[0][0] == "Tipología"
 
 
-def test_exc_integrity(cursor: pyodbc.Cursor):
+async def test_exc_integrity(cursor: pyodbc.Cursor):
     "Make sure an IntegretyError is raised"
     # This is really making sure we are properly encoding and comparing the SQLSTATEs.
-    cursor.execute("create table t1(s1 varchar(10) primary key)")
-    cursor.execute("insert into t1 values ('one')")
+    await cursor.execute("create table t1(s1 varchar(10) primary key)")
+    await cursor.execute("insert into t1 values ('one')")
     with pytest.raises(pyodbc.IntegrityError):
-        cursor.execute("insert into t1 values ('one')")
+        await cursor.execute("insert into t1 values ('one')")
 
 
-def test_multiple_bindings(cursor: pyodbc.Cursor):
+async def test_multiple_bindings(cursor: pyodbc.Cursor):
     "More than one bind and select on a cursor"
-    cursor.execute("create table t1(n int)")
-    cursor.execute("insert into t1 values (?)", 1)
-    cursor.execute("insert into t1 values (?)", 2)
-    cursor.execute("insert into t1 values (?)", 3)
+    await cursor.execute("create table t1(n int)")
+    await cursor.execute("insert into t1 values (?)", 1)
+    await cursor.execute("insert into t1 values (?)", 2)
+    await cursor.execute("insert into t1 values (?)", 3)
     for _ in range(3):
-        cursor.execute("select n from t1 where n < ?", 10)
-        cursor.execute("select n from t1 where n < 3")
+        await cursor.execute("select n from t1 where n < ?", 10)
+        await cursor.execute("select n from t1 where n < 3")
 
 
-def test_different_bindings(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(n int)")
-    cursor.execute("create table t2(d datetime)")
-    cursor.execute("insert into t1 values (?)", 1)
-    cursor.execute("insert into t2 values (?)", datetime.now())
+async def test_different_bindings(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(n int)")
+    await cursor.execute("create table t2(d datetime)")
+    await cursor.execute("insert into t1 values (?)", 1)
+    await cursor.execute("insert into t2 values (?)", datetime.now())
 
 
 SMALL_FENCEPOST_SIZES = [None, 0, 1, 255, 256, 510, 511, 512, 1023, 1024, 2047, 2048, 4000]
 LARGE_FENCEPOST_SIZES = SMALL_FENCEPOST_SIZES + [4095, 4096, 4097, 10 * 1024, 20 * 1024]
 
 
-def _test_vartype(cursor: pyodbc.Cursor, datatype):
+async def _test_vartype(cursor: pyodbc.Cursor, datatype):
 
     is_binary = datatype in {"blob", "varbinary"}
     encoding = "utf8" if is_binary else None
@@ -247,10 +252,10 @@ def _test_vartype(cursor: pyodbc.Cursor, datatype):
             cursor.connection.readvar_initsize = initsize
 
         if datatype == 'text':
-            cursor.execute(f"create table t1(c1 {datatype})")
+            await cursor.execute(f"create table t1(c1 {datatype})")
         else:
             maxlen = lengths[-1]
-            cursor.execute(f"create table t1(c1 {datatype}({maxlen}))")
+            await cursor.execute(f"create table t1(c1 {datatype}({maxlen}))")
 
         for length in lengths:
 
@@ -262,12 +267,12 @@ def _test_vartype(cursor: pyodbc.Cursor, datatype):
             if length is None and IS_FREETDS and is_binary and DRIVER_VERSION < (1, 5, 16):
                 continue
 
-            cursor.execute("delete from t1")
+            await cursor.execute("delete from t1")
 
             value = _generate_str(length, encoding=encoding)
 
             try:
-                cursor.execute("insert into t1 values(?)", value)
+                await cursor.execute("insert into t1 values(?)", value)
             except pyodbc.Error as ex:
                 if value is None:
                     msg = f"{datatype} insert of NULL failed"
@@ -275,21 +280,21 @@ def _test_vartype(cursor: pyodbc.Cursor, datatype):
                     msg = f'{datatype} insert failed: length={length} len={len(value)}'
                 raise Exception(msg) from ex
 
-            v = cursor.execute("select * from t1").fetchone()[0]
+            v = (await (await cursor.execute("select * from t1")).fetchone())[0]
             assert v == value
 
-        cursor.execute("drop table t1")
+        await cursor.execute("drop table t1")
 
 
-def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
+async def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
     """
     A simple test wrapper for types that are identical when written and read.
     """
-    cursor.execute(f"create table t1(c1 {datatype})")
+    await cursor.execute(f"create table t1(c1 {datatype})")
     for value in values:
-        cursor.execute("delete from t1")
-        cursor.execute("insert into t1 values (?)", value)
-        v = cursor.execute("select c1 from t1").fetchone()[0]
+        await cursor.execute("delete from t1")
+        await cursor.execute("insert into t1 values (?)", value)
+        v = (await (await cursor.execute("select c1 from t1")).fetchone())[0]
         assert v == value
 
 
@@ -299,45 +304,45 @@ def test_noscan(cursor: pyodbc.Cursor):
     assert cursor.noscan is True
 
 
-def test_nonnative_uuid(cursor: pyodbc.Cursor):
+async def test_nonnative_uuid(cursor: pyodbc.Cursor):
     # Resetting the native_uuid flag should force return of a text value.
     # Note that SQL Server seems to always return uppercase.
     value = uuid.uuid4()
-    cursor.execute("create table t1(n uniqueidentifier)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(n uniqueidentifier)")
+    await cursor.execute("insert into t1 values (?)", value)
 
     saved_native_uuid = pyodbc.native_uuid
     try:
         pyodbc.native_uuid = False
-        result = cursor.execute("select n from t1").fetchval()
+        result = await (await cursor.execute("select n from t1")).fetchval()
     finally:
         pyodbc.native_uuid = saved_native_uuid
     assert isinstance(result, str)
     assert result == str(value).upper()
 
 
-def test_native_uuid(cursor: pyodbc.Cursor):
+async def test_native_uuid(cursor: pyodbc.Cursor):
     # With the native_uuid flag set we should get a uuid.UUID object.
     value = uuid.uuid4()
-    cursor.execute("create table t1(n uniqueidentifier)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(n uniqueidentifier)")
+    await cursor.execute("insert into t1 values (?)", value)
 
     saved_native_uuid = pyodbc.native_uuid
     try:
         pyodbc.native_uuid = True
-        result = cursor.execute("select n from t1").fetchval()
+        result = await (await cursor.execute("select n from t1")).fetchval()
     finally:
         pyodbc.native_uuid = saved_native_uuid
     assert isinstance(result, uuid.UUID)
     assert value == result
 
 
-def test_nextset(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(i int)")
+async def test_nextset(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(i int)")
     for i in range(4):
-        cursor.execute("insert into t1(i) values(?)", i)
+        await cursor.execute("insert into t1(i) values(?)", i)
 
-    cursor.execute(
+    await cursor.execute(
         """
         select i from t1 where i < 2 order by i;
         select i from t1 where i >= 2 order by i
@@ -346,53 +351,53 @@ def test_nextset(cursor: pyodbc.Cursor):
     for i, row in enumerate(cursor):
         assert i == row.i
 
-    assert cursor.nextset()
+    assert await cursor.nextset()
 
     for i, row in enumerate(cursor):
         assert i + 2 == row.i
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='https://github.com/FreeTDS/freetds/issues/230')
-def test_nextset_with_raiserror(cursor: pyodbc.Cursor):
-    cursor.execute("select i = 1; RAISERROR('c', 16, 1);")
+async def test_nextset_with_raiserror(cursor: pyodbc.Cursor):
+    await cursor.execute("select i = 1; RAISERROR('c', 16, 1);")
     row = next(cursor)
     assert row.i == 1
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.nextset()
+        await cursor.nextset()
 
 
-def test_fixed_unicode(cursor: pyodbc.Cursor):
+async def test_fixed_unicode(cursor: pyodbc.Cursor):
     value = "t\xebsting"
-    cursor.execute("create table t1(s nchar(7))")
-    cursor.execute("insert into t1 values(?)", "t\xebsting")
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s nchar(7))")
+    await cursor.execute("insert into t1 values(?)", "t\xebsting")
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert isinstance(v, str)
     assert len(v) == len(value)
     # If we alloc'd wrong, the test below might work because of an embedded NULL
     assert v == value
 
 
-def test_chinese(cursor: pyodbc.Cursor):
+async def test_chinese(cursor: pyodbc.Cursor):
     v = '我的'
-    cursor.execute("SELECT N'我的' AS [Name]")
-    row = cursor.fetchone()
+    await cursor.execute("SELECT N'我的' AS [Name]")
+    row = await cursor.fetchone()
     assert row[0] == v
 
-    cursor.execute("SELECT N'我的' AS [Name]")
-    rows = cursor.fetchall()
+    await cursor.execute("SELECT N'我的' AS [Name]")
+    rows = await cursor.fetchall()
     assert rows[0][0] == v
 
 
-def test_bit(cursor: pyodbc.Cursor):
+async def test_bit(cursor: pyodbc.Cursor):
     value = True
-    cursor.execute("create table t1(b bit)")
-    cursor.execute("insert into t1 values (?)", value)
-    v = cursor.execute("select b from t1").fetchone()[0]
+    await cursor.execute("create table t1(b bit)")
+    await cursor.execute("insert into t1 values (?)", value)
+    v = (await (await cursor.execute("select b from t1")).fetchone())[0]
     assert isinstance(v, bool)
     assert v == value
 
 
-def test_decimal(cursor: pyodbc.Cursor):
+async def test_decimal(cursor: pyodbc.Cursor):
     # From test provided by planders (thanks!) in Issue 91
 
     for mode in (True, False):
@@ -403,11 +408,11 @@ def test_decimal(cursor: pyodbc.Cursor):
 
             cursor.connection.fetch_decimal_as_string = mode
             try:
-                cursor.execute("drop table t1")
+                await cursor.execute("drop table t1")
             except Exception:
                 pass
 
-            cursor.execute(f"create table t1(d decimal({precision}, {scale}))")
+            await cursor.execute(f"create table t1(d decimal({precision}, {scale}))")
 
             # Construct a decimal that uses the maximum precision and scale.
             sign   = negative and '-' or ''
@@ -416,26 +421,26 @@ def test_decimal(cursor: pyodbc.Cursor):
             decStr = f'{sign}{before}{after}'
             value = Decimal(decStr)
 
-            cursor.execute("insert into t1 values(?)", value)
+            await cursor.execute("insert into t1 values(?)", value)
 
-            v = cursor.execute("select d from t1").fetchval()
+            v = await (await cursor.execute("select d from t1")).fetchval()
             assert v == value
 
 
-def test_decimal_e(cursor: pyodbc.Cursor):
+async def test_decimal_e(cursor: pyodbc.Cursor):
     """Ensure exponential notation decimals are properly handled"""
     value = Decimal((0, (1, 2, 3), 5))  # prints as 1.23E+7
-    cursor.execute("create table t1(d decimal(10, 2))")
-    cursor.execute("insert into t1 values (?)", value)
-    result = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(d decimal(10, 2))")
+    await cursor.execute("insert into t1 values (?)", value)
+    result = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert result == value
 
 
-def test_subquery_params(cursor: pyodbc.Cursor):
+async def test_subquery_params(cursor: pyodbc.Cursor):
     """Ensure parameter markers work in a subquery"""
-    cursor.execute("create table t1(id integer, s varchar(20))")
-    cursor.execute("insert into t1 values (?,?)", 1, 'test')
-    row = cursor.execute("""
+    await cursor.execute("create table t1(id integer, s varchar(20))")
+    await cursor.execute("insert into t1 values (?,?)", 1, 'test')
+    row = await (await cursor.execute("""
                               select x.id
                               from (
                                 select id
@@ -443,77 +448,77 @@ def test_subquery_params(cursor: pyodbc.Cursor):
                                 where s = ?
                                   and id between ? and ?
                                ) x
-                               """, 'test', 1, 10).fetchone()
+                               """, 'test', 1, 10)).fetchone()
     assert row is not None
     assert row[0] == 1
 
 
-def test_close_cnxn():
+async def test_close_cnxn():
     """Make sure using a Cursor after closing its connection doesn't crash."""
 
-    cnxn = connect()
+    cnxn = await connect()
     cursor = cnxn.cursor()
 
-    cursor.execute("drop table if exists t1")
-    cursor.execute("create table t1(id integer, s varchar(20))")
-    cursor.execute("insert into t1 values (?,?)", 1, 'test')
-    cursor.execute("select * from t1")
+    await cursor.execute("drop table if exists t1")
+    await cursor.execute("create table t1(id integer, s varchar(20))")
+    await cursor.execute("insert into t1 values (?,?)", 1, 'test')
+    await cursor.execute("select * from t1")
 
-    cnxn.close()
+    await cnxn.close()
 
     # Now that the connection is closed, we expect an exception.  (If the code attempts to use
     # the HSTMT, we'll get an access violation instead.)
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.execute("select * from t1")
+        await cursor.execute("select * from t1")
 
 
-def test_empty_string(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(s varchar(20))")
-    cursor.execute("insert into t1 values(?)", "")
+async def test_empty_string(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(s varchar(20))")
+    await cursor.execute("insert into t1 values(?)", "")
 
 
-def test_empty_string_encoding():
-    cnxn = connect()
+async def test_empty_string_encoding():
+    cnxn = await connect()
     cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='shift_jis')
     value = ""
     cursor = cnxn.cursor()
-    cursor.execute("create table t1(s varchar(20))")
-    cursor.execute("insert into t1 values(?)", value)
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s varchar(20))")
+    await cursor.execute("insert into t1 values(?)", value)
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert v == value
 
 
-def test_fixed_str(cursor: pyodbc.Cursor):
+async def test_fixed_str(cursor: pyodbc.Cursor):
     value = "testing"
-    cursor.execute("create table t1(s char(7))")
-    cursor.execute("insert into t1 values(?)", value)
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s char(7))")
+    await cursor.execute("insert into t1 values(?)", value)
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert isinstance(v, str)
     assert len(v) == len(value)
     # If we alloc'd wrong, the test below might work because of an embedded NULL
     assert v == value
 
 
-def test_empty_unicode(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(s nvarchar(20))")
-    cursor.execute("insert into t1 values(?)", "")
+async def test_empty_unicode(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(s nvarchar(20))")
+    await cursor.execute("insert into t1 values(?)", "")
 
 
-def test_empty_unicode_encoding():
-    cnxn = connect()
+async def test_empty_unicode_encoding():
+    cnxn = await connect()
     cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='shift_jis')
     value = ""
     cursor = cnxn.cursor()
-    cursor.execute("create table t1(s nvarchar(20))")
-    cursor.execute("insert into t1 values(?)", value)
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s nvarchar(20))")
+    await cursor.execute("insert into t1 values(?)", value)
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert v == value
 
 
-def test_negative_row_index(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(s varchar(20))")
-    cursor.execute("insert into t1 values(?)", "1")
-    row = cursor.execute("select * from t1").fetchone()
+async def test_negative_row_index(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(s varchar(20))")
+    await cursor.execute("insert into t1 values(?)", "1")
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert row[0] == "1"
     assert row[-1] == "1"
 
@@ -524,105 +529,105 @@ def test_version():
 
 @pytest.mark.skipif(IS_MSODBCSQL and SQLSERVER_YEAR < 2008,
                     reason='Date not supported until 2008?')
-def test_date(cursor: pyodbc.Cursor):
+async def test_date(cursor: pyodbc.Cursor):
     value = date.today()
 
-    cursor.execute("create table t1(d date)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(d date)")
+    await cursor.execute("insert into t1 values (?)", value)
 
-    result = cursor.execute("select d from t1").fetchone()[0]
+    result = (await (await cursor.execute("select d from t1")).fetchone())[0]
     assert isinstance(result, date)
     assert value == result
 
 
 @pytest.mark.skipif(IS_MSODBCSQL and SQLSERVER_YEAR < 2008,
                     reason='Time not supported until 2008?')
-def test_time(cursor: pyodbc.Cursor):
+async def test_time(cursor: pyodbc.Cursor):
     value = datetime.now().time()
 
     # We aren't yet writing values using the new extended time type so the value written to the
     # database is only down to the second.
     value = value.replace(microsecond=0)
 
-    cursor.execute("create table t1(t time)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(t time)")
+    await cursor.execute("insert into t1 values (?)", value)
 
-    result = cursor.execute("select t from t1").fetchone()[0]
+    result = (await (await cursor.execute("select t from t1")).fetchone())[0]
     assert isinstance(result, time)
     assert value == result
 
 
-def test_datetime(cursor: pyodbc.Cursor):
+async def test_datetime(cursor: pyodbc.Cursor):
     value = datetime(2007, 1, 15, 3, 4, 5)
 
-    cursor.execute("create table t1(dt datetime)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(dt datetime)")
+    await cursor.execute("insert into t1 values (?)", value)
 
-    result = cursor.execute("select dt from t1").fetchone()[0]
+    result = (await (await cursor.execute("select dt from t1")).fetchone())[0]
     assert isinstance(result, datetime)
     assert value == result
 
 
-def test_datetime_fraction(cursor: pyodbc.Cursor):
+async def test_datetime_fraction(cursor: pyodbc.Cursor):
     # SQL Server supports milliseconds, but Python's datetime supports nanoseconds, so the most
     # granular datetime supported is xxx000.
 
     value = datetime(2007, 1, 15, 3, 4, 5, 123000)
 
-    cursor.execute("create table t1(dt datetime)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(dt datetime)")
+    await cursor.execute("insert into t1 values (?)", value)
 
-    result = cursor.execute("select dt from t1").fetchone()[0]
+    result = (await (await cursor.execute("select dt from t1")).fetchone())[0]
     assert isinstance(result, datetime)
     assert value == result
 
 
-def test_datetime_fraction_rounded(cursor: pyodbc.Cursor):
+async def test_datetime_fraction_rounded(cursor: pyodbc.Cursor):
     # SQL Server supports milliseconds, but Python's datetime supports nanoseconds.  pyodbc
     # rounds down to what the database supports.
 
     full    = datetime(2007, 1, 15, 3, 4, 5, 123456)
     rounded = datetime(2007, 1, 15, 3, 4, 5, 123000)
 
-    cursor.execute("create table t1(dt datetime)")
-    cursor.execute("insert into t1 values (?)", full)
+    await cursor.execute("create table t1(dt datetime)")
+    await cursor.execute("insert into t1 values (?)", full)
 
-    result = cursor.execute("select dt from t1").fetchone()[0]
+    result = (await (await cursor.execute("select dt from t1")).fetchone())[0]
     assert isinstance(result, datetime)
     assert rounded == result
 
 
-def test_datetime2(cursor: pyodbc.Cursor):
+async def test_datetime2(cursor: pyodbc.Cursor):
     value = datetime(2007, 1, 15, 3, 4, 5)
 
-    cursor.execute("create table t1(dt datetime2)")
-    cursor.execute("insert into t1 values (?)", value)
+    await cursor.execute("create table t1(dt datetime2)")
+    await cursor.execute("insert into t1 values (?)", value)
 
-    result = cursor.execute("select dt from t1").fetchone()[0]
+    result = (await (await cursor.execute("select dt from t1")).fetchone())[0]
     assert isinstance(result, datetime)
     assert value == result
 
 
-def test_sp_results(cursor: pyodbc.Cursor):
-    cursor.execute(
+async def test_sp_results(cursor: pyodbc.Cursor):
+    await cursor.execute(
         """
         Create procedure proc1
         AS
           select top 10 name, id, xtype, refdate
           from sysobjects
         """)
-    rows = cursor.execute("exec proc1").fetchall()
+    rows = await (await cursor.execute("exec proc1")).fetchall()
     assert isinstance(rows, list)
     assert len(rows) == 10  # there has to be at least 10 items in sysobjects
     assert isinstance(rows[0].refdate, datetime)
 
 
-def test_sp_results_from_temp(cursor: pyodbc.Cursor):
+async def test_sp_results_from_temp(cursor: pyodbc.Cursor):
 
     # Note: I've used "set nocount on" so that we don't get the number of rows deleted from
     # #tmptable.  If you don't do this, you'd need to call nextset() once to skip it.
 
-    cursor.execute(
+    await cursor.execute(
         """
         Create procedure proc1
         AS
@@ -633,18 +638,18 @@ def test_sp_results_from_temp(cursor: pyodbc.Cursor):
 
           select * from #tmptable
         """)
-    cursor.execute("exec proc1")
+    await cursor.execute("exec proc1")
     assert cursor.description is not None
     assert len(cursor.description) == 4
 
-    rows = cursor.fetchall()
+    rows = await cursor.fetchall()
     assert isinstance(rows, list)
     assert len(rows) == 10      # there has to be at least 10 items in sysobjects
     assert isinstance(rows[0].refdate, datetime)
 
 
-def test_sp_results_from_vartbl(cursor: pyodbc.Cursor):
-    cursor.execute(
+async def test_sp_results_from_vartbl(cursor: pyodbc.Cursor):
+    await cursor.execute(
         """
         Create procedure proc1
         AS
@@ -657,22 +662,22 @@ def test_sp_results_from_vartbl(cursor: pyodbc.Cursor):
 
           select * from @tmptbl
         """)
-    cursor.execute("exec proc1")
-    rows = cursor.fetchall()
+    await cursor.execute("exec proc1")
+    rows = await cursor.fetchall()
     assert isinstance(rows, list)
     assert len(rows) == 10  # there has to be at least 10 items in sysobjects
     assert isinstance(rows[0].refdate, datetime)
 
 
-def test_sp_with_dates(cursor: pyodbc.Cursor):
+async def test_sp_with_dates(cursor: pyodbc.Cursor):
     # Reported in the forums that passing two datetimes to a stored procedure doesn't work.
-    cursor.execute(
+    await cursor.execute(
         """
         if exists (select * from dbo.sysobjects where id = object_id(N'[test_sp]')
              and OBJECTPROPERTY(id, N'IsProcedure') = 1)
           drop procedure [dbo].[test_sp]
         """)
-    cursor.execute(
+    await cursor.execute(
         """
         create procedure test_sp(@d1 datetime, @d2 datetime)
         AS
@@ -680,21 +685,21 @@ def test_sp_with_dates(cursor: pyodbc.Cursor):
           set @d = datediff(year, @d1, @d2)
           select @d
         """)
-    cursor.execute("exec test_sp ?, ?", datetime.now(), datetime.now())
-    rows = cursor.fetchall()
+    await cursor.execute("exec test_sp ?, ?", datetime.now(), datetime.now())
+    rows = await cursor.fetchall()
     assert rows is not None
     assert rows[0][0] == 0   # 0 years apart
 
 
-def test_sp_with_none(cursor: pyodbc.Cursor):
+async def test_sp_with_none(cursor: pyodbc.Cursor):
     # Reported in the forums that passing None caused an error.
-    cursor.execute(
+    await cursor.execute(
         """
         if exists (select * from dbo.sysobjects where id = object_id(N'[test_sp]')
              and OBJECTPROPERTY(id, N'IsProcedure') = 1)
           drop procedure [dbo].[test_sp]
         """)
-    cursor.execute(
+    await cursor.execute(
         """
         create procedure test_sp(@x varchar(20))
         AS
@@ -702,8 +707,8 @@ def test_sp_with_none(cursor: pyodbc.Cursor):
           set @y = @x
           select @y
         """)
-    cursor.execute("exec test_sp ?", None)
-    rows = cursor.fetchall()
+    await cursor.execute("exec test_sp ?", None)
+    rows = await cursor.fetchall()
     assert rows is not None
     assert rows[0][0] is None   # 0 years apart
 
@@ -713,21 +718,21 @@ def test_sp_with_none(cursor: pyodbc.Cursor):
 #
 
 
-def test_rowcount_delete(cursor: pyodbc.Cursor):
+async def test_rowcount_delete(cursor: pyodbc.Cursor):
     # After DDL (DROP TABLE), rowcount is driver-defined per the ODBC spec.
     # Microsoft's driver might reliably return -1 here, but that's not true
     # for FreeTDS.
     if IS_MSODBCSQL:
         assert cursor.rowcount == -1
-    cursor.execute("create table t1(i int)")
+    await cursor.execute("create table t1(i int)")
     count = 4
     for i in range(count):
-        cursor.execute("insert into t1 values (?)", i)
-    cursor.execute("delete from t1")
+        await cursor.execute("insert into t1 values (?)", i)
+    await cursor.execute("delete from t1")
     assert cursor.rowcount == count
 
 
-def test_rowcount_nodata(cursor: pyodbc.Cursor):
+async def test_rowcount_nodata(cursor: pyodbc.Cursor):
     """
     This represents a different code path than a delete that deleted something.
 
@@ -735,13 +740,13 @@ def test_rowcount_nodata(cursor: pyodbc.Cursor):
     SQL_NO_DATA to step over the code that errors out and drop down to the same SQLRowCount
     code.  On the other hand, we could hardcode a zero return value.
     """
-    cursor.execute("create table t1(i int)")
+    await cursor.execute("create table t1(i int)")
     # This is a different code path internally.
-    cursor.execute("delete from t1")
+    await cursor.execute("delete from t1")
     assert cursor.rowcount == 0
 
 
-def test_rowcount_select(cursor: pyodbc.Cursor):
+async def test_rowcount_select(cursor: pyodbc.Cursor):
     """
     Ensure Cursor.rowcount is set properly after a select statement.
 
@@ -749,39 +754,39 @@ def test_rowcount_select(cursor: pyodbc.Cursor):
     returns -1 after a select statement, so we'll test for that behavior.  This is valid
     behavior according to the DB API specification, but people don't seem to like it.
     """
-    cursor.execute("create table t1(i int)")
+    await cursor.execute("create table t1(i int)")
     count = 4
     for i in range(count):
-        cursor.execute("insert into t1 values (?)", i)
-    cursor.execute("select * from t1")
+        await cursor.execute("insert into t1 values (?)", i)
+    await cursor.execute("select * from t1")
     assert cursor.rowcount == -1
 
-    rows = cursor.fetchall()
+    rows = await cursor.fetchall()
     assert len(rows) == count
     assert cursor.rowcount == -1
 
 
-def test_rowcount_reset(cursor: pyodbc.Cursor):
+async def test_rowcount_reset(cursor: pyodbc.Cursor):
     "Ensure rowcount is reset after DDL"
-    cursor.execute("create table t1(i int)")
+    await cursor.execute("create table t1(i int)")
     count = 4
     for i in range(count):
-        cursor.execute("insert into t1 values (?)", i)
+        await cursor.execute("insert into t1 values (?)", i)
     assert cursor.rowcount == 1
 
-    cursor.execute("create table t2(i int)")
+    await cursor.execute("create table t2(i int)")
     ddl_rowcount = (0 if IS_FREETDS else -1)
     assert cursor.rowcount == ddl_rowcount
 
 
-def test_retcursor_delete(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(i int)")
-    cursor.execute("insert into t1 values (1)")
-    v = cursor.execute("delete from t1")
+async def test_retcursor_delete(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(i int)")
+    await cursor.execute("insert into t1 values (1)")
+    v = await cursor.execute("delete from t1")
     assert v == cursor
 
 
-def test_retcursor_nodata(cursor: pyodbc.Cursor):
+async def test_retcursor_nodata(cursor: pyodbc.Cursor):
     """
     This represents a different code path than a delete that deleted something.
 
@@ -789,41 +794,41 @@ def test_retcursor_nodata(cursor: pyodbc.Cursor):
     SQL_NO_DATA to step over the code that errors out and drop down to the same SQLRowCount
     code.
     """
-    cursor.execute("create table t1(i int)")
+    await cursor.execute("create table t1(i int)")
     # This is a different code path internally.
-    v = cursor.execute("delete from t1")
+    v = await cursor.execute("delete from t1")
     assert v == cursor
 
 
-def test_retcursor_select(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(i int)")
-    cursor.execute("insert into t1 values (1)")
-    v = cursor.execute("select * from t1")
+async def test_retcursor_select(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(i int)")
+    await cursor.execute("insert into t1 values (1)")
+    v = await cursor.execute("select * from t1")
     assert v == cursor
 
 
-def table_with_spaces(cursor: pyodbc.Cursor):
+async def table_with_spaces(cursor: pyodbc.Cursor):
     "Ensure we can select using [x z] syntax"
 
     try:
-        cursor.execute("create table [test one](int n)")
-        cursor.execute("insert into [test one] values(1)")
-        cursor.execute("select * from [test one]")
-        v = cursor.fetchone()[0]
+        await cursor.execute("create table [test one](int n)")
+        await cursor.execute("insert into [test one] values(1)")
+        await cursor.execute("select * from [test one]")
+        v = (await cursor.fetchone())[0]
         assert v == 1
     finally:
-        cursor.rollback()
+        await cursor.rollback()
 
 
-def test_lower_case():
+async def test_lower_case():
     "Ensure pyodbc.lowercase forces returned column names to lowercase."
     try:
         pyodbc.lowercase = True
-        cnxn = connect()
+        cnxn = await connect()
         cursor = cnxn.cursor()
 
-        cursor.execute("create table t1(Abc int, dEf int)")
-        cursor.execute("select * from t1")
+        await cursor.execute("create table t1(Abc int, dEf int)")
+        await cursor.execute("select * from t1")
 
         names = [t[0] for t in cursor.description]
         names.sort()
@@ -834,42 +839,42 @@ def test_lower_case():
         pyodbc.lowercase = False
 
 
-def test_row_description(cursor: pyodbc.Cursor):
+async def test_row_description(cursor: pyodbc.Cursor):
     """
     Ensure Cursor.description is accessible as Row.cursor_description.
     """
-    cursor.execute("create table t1(a int, b char(3))")
-    cursor.execute("insert into t1 values(1, 'abc')")
-    row = cursor.execute("select * from t1").fetchone()
+    await cursor.execute("create table t1(a int, b char(3))")
+    await cursor.execute("insert into t1 values(1, 'abc')")
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert cursor.description == row.cursor_description
 
 
-def test_temp_select(cursor: pyodbc.Cursor):
+async def test_temp_select(cursor: pyodbc.Cursor):
     # A project was failing to create temporary tables via select into.
-    cursor.execute("create table t1(s char(7))")
-    cursor.execute("insert into t1 values(?)", "testing")
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("create table t1(s char(7))")
+    await cursor.execute("insert into t1 values(?)", "testing")
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert isinstance(v, str)
     assert v == "testing"
 
-    cursor.execute("select s into t2 from t1")
-    v = cursor.execute("select * from t1").fetchone()[0]
+    await cursor.execute("select s into t2 from t1")
+    v = (await (await cursor.execute("select * from t1")).fetchone())[0]
     assert isinstance(v, str)
     assert v == "testing"
 
 
-def test_executemany(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(a int, b varchar(10))")
+async def test_executemany(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(a int, b varchar(10))")
 
     params = [(i, str(i)) for i in range(1, 6)]
 
-    cursor.executemany("insert into t1(a, b) values (?,?)", params)
+    await cursor.executemany("insert into t1(a, b) values (?,?)", params)
 
-    count = cursor.execute("select count(*) from t1").fetchone()[0]
+    count = (await (await cursor.execute("select count(*) from t1")).fetchone())[0]
     assert count == len(params)
 
-    cursor.execute("select a, b from t1 order by a")
-    rows = cursor.fetchall()
+    await cursor.execute("select a, b from t1 order by a")
+    rows = await cursor.fetchall()
     assert count == len(rows)
 
     for param, row in zip(params, rows):
@@ -877,19 +882,19 @@ def test_executemany(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-def test_executemany_one(cursor: pyodbc.Cursor):
+async def test_executemany_one(cursor: pyodbc.Cursor):
     "Pass executemany a single sequence"
-    cursor.execute("create table t1(a int, b varchar(10))")
+    await cursor.execute("create table t1(a int, b varchar(10))")
 
     params = [(1, "test")]
 
-    cursor.executemany("insert into t1(a, b) values (?,?)", params)
+    await cursor.executemany("insert into t1(a, b) values (?,?)", params)
 
-    count = cursor.execute("select count(*) from t1").fetchone()[0]
+    count = (await (await cursor.execute("select count(*) from t1")).fetchone())[0]
     assert count == len(params)
 
-    cursor.execute("select a, b from t1 order by a")
-    rows = cursor.fetchall()
+    await cursor.execute("select a, b from t1 order by a")
+    rows = await cursor.fetchall()
     assert count == len(rows)
 
     for param, row in zip(params, rows):
@@ -897,39 +902,39 @@ def test_executemany_one(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-def test_executemany_dae_0(cursor: pyodbc.Cursor):
+async def test_executemany_dae_0(cursor: pyodbc.Cursor):
     """
     DAE for 0-length value
     """
-    cursor.execute("create table t1(a nvarchar(max))")
+    await cursor.execute("create table t1(a nvarchar(max))")
 
     cursor.fast_executemany = True
-    cursor.executemany("insert into t1(a) values(?)", [['']])
+    await cursor.executemany("insert into t1(a) values(?)", [['']])
 
-    assert cursor.execute("select a from t1").fetchone()[0] == ''
+    assert (await (await cursor.execute("select a from t1")).fetchone())[0] == ''
 
     cursor.fast_executemany = False
 
 
-def test_executemany_failure(cursor: pyodbc.Cursor):
+async def test_executemany_failure(cursor: pyodbc.Cursor):
     """
     Ensure that an exception is raised if one query in an executemany fails.
     """
-    cursor.execute("create table t1(a int, b varchar(10))")
+    await cursor.execute("create table t1(a int, b varchar(10))")
 
     params = [(1, 'good'),
               ('error', 'not an int'),
               (3, 'good')]
 
     with pytest.raises(pyodbc.Error):
-        cursor.executemany("insert into t1(a, b) value (?, ?)", params)
+        await cursor.executemany("insert into t1(a, b) value (?, ?)", params)
 
 
-def test_row_slicing(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(a int, b int, c int, d int)")
-    cursor.execute("insert into t1 values(1,2,3,4)")
+async def test_row_slicing(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(a int, b int, c int, d int)")
+    await cursor.execute("insert into t1 values(1,2,3,4)")
 
-    row = cursor.execute("select * from t1").fetchone()
+    row = await (await cursor.execute("select * from t1")).fetchone()
 
     result = row[:]
     assert result is row
@@ -941,11 +946,11 @@ def test_row_slicing(cursor: pyodbc.Cursor):
     assert result is row
 
 
-def test_row_repr(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(a int, b int, c int, d varchar(50))")
-    cursor.execute("insert into t1 values(1,2,3,'four')")
+async def test_row_repr(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(a int, b int, c int, d varchar(50))")
+    await cursor.execute("insert into t1 values(1,2,3,'four')")
 
-    row = cursor.execute("select * from t1").fetchone()
+    row = await (await cursor.execute("select * from t1")).fetchone()
 
     result = str(row)
     assert result == "(1, 2, 3, 'four')"
@@ -957,57 +962,58 @@ def test_row_repr(cursor: pyodbc.Cursor):
     assert result == "(1,)"
 
 
-def test_concatenation(cursor: pyodbc.Cursor):
+async def test_concatenation(cursor: pyodbc.Cursor):
     v2 = '0123456789' * 30
     v3 = '9876543210' * 30
 
-    cursor.execute("create table t1(c1 int identity(1, 1), c2 varchar(300), c3 varchar(300))")
-    cursor.execute("insert into t1(c2, c3) values (?,?)", v2, v3)
+    await cursor.execute(
+        "create table t1(c1 int identity(1, 1), c2 varchar(300), c3 varchar(300))")
+    await cursor.execute("insert into t1(c2, c3) values (?,?)", v2, v3)
 
-    row = cursor.execute("select c2, c3, c2 + c3 as both from t1").fetchone()
+    row = await (await cursor.execute("select c2, c3, c2 + c3 as both from t1")).fetchone()
 
     assert row.both == v2 + v3
 
 
-def test_view_select(cursor: pyodbc.Cursor):
+async def test_view_select(cursor: pyodbc.Cursor):
     # Reported in forum: Can't select from a view?  I think I do this a lot, but another test
     # never hurts.
 
     # Create a table (t1) with 3 rows and a view (t2) into it.
-    cursor.execute("create table t1(c1 int identity(1, 1), c2 varchar(50))")
+    await cursor.execute("create table t1(c1 int identity(1, 1), c2 varchar(50))")
     for i in range(3):
-        cursor.execute("insert into t1(c2) values (?)", f"string{i}")
-    cursor.execute("create view t2 as select * from t1")
+        await cursor.execute("insert into t1(c2) values (?)", f"string{i}")
+    await cursor.execute("create view t2 as select * from t1")
 
     # Select from the view
-    cursor.execute("select * from t2")
-    rows = cursor.fetchall()
+    await cursor.execute("select * from t2")
+    rows = await cursor.fetchall()
     assert rows is not None
     assert len(rows) == 3
 
 
-def test_autocommit():
-    cnxn = connect()
+async def test_autocommit():
+    cnxn = await connect()
     assert cnxn.autocommit is False
     cnxn = None
 
-    cnxn = connect(autocommit=True)
+    cnxn = await connect(autocommit=True)
     assert cnxn.autocommit is True
     cnxn.autocommit = False
     assert cnxn.autocommit is False
 
 
-def test_sqlserver_callproc(cursor: pyodbc.Cursor):
+async def test_sqlserver_callproc(cursor: pyodbc.Cursor):
     try:
-        cursor.execute("drop procedure pyodbctest")
-        cursor.commit()
+        await cursor.execute("drop procedure pyodbctest")
+        await cursor.commit()
     except Exception:
         pass
 
-    cursor.execute("create table t1(s varchar(10))")
-    cursor.execute("insert into t1 values(?)", "testing")
+    await cursor.execute("create table t1(s varchar(10))")
+    await cursor.execute("insert into t1 values(?)", "testing")
 
-    cursor.execute("""
+    await cursor.execute("""
                     create procedure pyodbctest @var1 varchar(32)
                     as
                     begin
@@ -1016,23 +1022,23 @@ def test_sqlserver_callproc(cursor: pyodbc.Cursor):
                     end
                     """)
 
-    cursor.execute("exec pyodbctest 'hi'")
+    await cursor.execute("exec pyodbctest 'hi'")
 
 
-def test_skip(cursor: pyodbc.Cursor):
+async def test_skip(cursor: pyodbc.Cursor):
     # Insert 1, 2, and 3.  Fetch 1, skip 2, fetch 3.
 
-    cursor.execute("create table t1(id int)")
+    await cursor.execute("create table t1(id int)")
     for i in range(1, 5):
-        cursor.execute("insert into t1 values(?)", i)
-    cursor.execute("select id from t1 order by id")
-    assert cursor.fetchone()[0] == 1
-    cursor.skip(2)
-    assert cursor.fetchone()[0] == 4
+        await cursor.execute("insert into t1 values(?)", i)
+    await cursor.execute("select id from t1 order by id")
+    assert (await cursor.fetchone())[0] == 1
+    await cursor.skip(2)
+    assert (await cursor.fetchone())[0] == 4
 
 
-def test_timeout():
-    cnxn = connect()
+async def test_timeout():
+    cnxn = await connect()
     assert cnxn.timeout == 0    # defaults to zero (off)
 
     cnxn.timeout = 30
@@ -1042,50 +1048,50 @@ def test_timeout():
     assert cnxn.timeout == 0
 
 
-def test_sets_execute(cursor: pyodbc.Cursor):
+async def test_sets_execute(cursor: pyodbc.Cursor):
     # Only lists and tuples are allowed.
-    cursor.execute("create table t1 (word varchar (100))")
+    await cursor.execute("create table t1 (word varchar (100))")
 
     words = {'a', 'b', 'c'}
 
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.execute("insert into t1 (word) values (?)", words)
+        await cursor.execute("insert into t1 (word) values (?)", words)
 
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.executemany("insert into t1 (word) values (?)", words)
+        await cursor.executemany("insert into t1 (word) values (?)", words)
 
 
-def test_row_execute(cursor: pyodbc.Cursor):
+async def test_row_execute(cursor: pyodbc.Cursor):
     "Ensure we can use a Row object as a parameter to execute"
-    cursor.execute("create table t1(n int, s varchar(10))")
-    cursor.execute("insert into t1 values (1, 'a')")
-    row = cursor.execute("select n, s from t1").fetchone()
+    await cursor.execute("create table t1(n int, s varchar(10))")
+    await cursor.execute("insert into t1 values (1, 'a')")
+    row = await (await cursor.execute("select n, s from t1")).fetchone()
     assert row
 
-    cursor.execute("create table t2(n int, s varchar(10))")
-    cursor.execute("insert into t2 values (?, ?)", row)
+    await cursor.execute("create table t2(n int, s varchar(10))")
+    await cursor.execute("insert into t2 values (?, ?)", row)
 
 
-def test_row_executemany(cursor: pyodbc.Cursor):
+async def test_row_executemany(cursor: pyodbc.Cursor):
     "Ensure we can use a Row object as a parameter to executemany"
-    cursor.execute("create table t1(n int, s varchar(10))")
+    await cursor.execute("create table t1(n int, s varchar(10))")
 
     for i in range(3):
-        cursor.execute("insert into t1 values (?, ?)", i, chr(ord('a') + i))
+        await cursor.execute("insert into t1 values (?, ?)", i, chr(ord('a') + i))
 
-    rows = cursor.execute("select n, s from t1").fetchall()
+    rows = await (await cursor.execute("select n, s from t1")).fetchall()
     assert len(rows) != 0
 
-    cursor.execute("create table t2(n int, s varchar(10))")
-    cursor.executemany("insert into t2 values (?, ?)", rows)
+    await cursor.execute("create table t2(n int, s varchar(10))")
+    await cursor.executemany("insert into t2 values (?, ?)", rows)
 
 
-def test_description(cursor: pyodbc.Cursor):
+async def test_description(cursor: pyodbc.Cursor):
     "Ensure cursor.description is correct"
 
-    cursor.execute("create table t1(n int, s varchar(8), d decimal(5,2))")
-    cursor.execute("insert into t1 values (1, 'abc', '1.23')")
-    cursor.execute("select * from t1")
+    await cursor.execute("create table t1(n int, s varchar(8), d decimal(5,2))")
+    await cursor.execute("insert into t1 values (1, 'abc', '1.23')")
+    await cursor.execute("select * from t1")
 
     # (I'm not sure the precision of an int is constant across different versions, bits, so I'm
     # hand checking the items I do know.
@@ -1114,7 +1120,7 @@ def test_description(cursor: pyodbc.Cursor):
     assert t[6] is True    # nullable
 
 
-def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
     """
     Ensure the Cursor.messages attribute is handled correctly with a simple PRINT statement.
     """
@@ -1122,7 +1128,7 @@ def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
 
     # ascii / extended ascii / unicode / beyond BMP unicode
     for msg in ('hello world', 'a \xeb a', 'b \u0394 b', 'c \U0001F31C c'):
-        cursor.execute(f"PRINT N'{msg}'")  # note, unicode literal
+        await cursor.execute(f"PRINT N'{msg}'")  # note, unicode literal
         messages = cursor.messages
         assert isinstance(messages, list)
         assert len(messages) == 1
@@ -1137,29 +1143,29 @@ def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
     # SQL Server PRINT statements are never more than 8000 characters
     # https://docs.microsoft.com/en-us/sql/t-sql/language-elements/print-transact-sql#remarks
     msg = 'ABCDEFGH' * 1000
-    cursor.execute(f"PRINT '{msg}'")  # note, plain ascii literal
+    await cursor.execute(f"PRINT '{msg}'")  # note, plain ascii literal
     messages = cursor.messages
     assert len(messages) == 1
     assert messages[0][1].endswith(msg)
 
     # Confirm that the PRINT message is captured when DAE kicks in.
     # https://github.com/mkleehammer/pyodbc/issues/1140
-    cursor.execute("PRINT 'HI!'; SELECT ?", "x" * 2001)
+    await cursor.execute("PRINT 'HI!'; SELECT ?", "x" * 2001)
     assert len(cursor.messages) == 1
     assert cursor.messages[0][1].endswith("HI!")
 
 
 @pytest.mark.skipif(IS_FREETDS and DRIVER_VERSION < (1, 5, 15),
                     reason="FreeTDS ignores bind offset")
-def test_cursor_messages_with_fast_executemany(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_fast_executemany(cursor: pyodbc.Cursor):
     """
     Ensure the Cursor.messages attribute is set with fast_executemany=True.
     """
-    cursor.execute("create table t2(id1 int, id2 int)")
-    cursor.commit()
+    await cursor.execute("create table t2(id1 int, id2 int)")
+    await cursor.commit()
 
     cursor.fast_executemany = True
-    cursor.executemany(
+    await cursor.executemany(
         "print 'hello';insert into t2(id1, id2) values (?, ?)",
         [(10, 11), (20, 21)],
     )
@@ -1167,11 +1173,11 @@ def test_cursor_messages_with_fast_executemany(cursor: pyodbc.Cursor):
     assert all(m[1].endswith('hello') for m in cursor.messages)
 
 
-def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
     """
     Complex scenario to test the Cursor.messages attribute.
     """
-    cursor.execute("""
+    await cursor.execute("""
         create or alter procedure test_cursor_messages as
         begin
             set nocount on;
@@ -1189,8 +1195,8 @@ def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
     # [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Message 1a
 
     # result set 1: messages, rows
-    cursor.execute("exec test_cursor_messages")
-    vals = [row[0] for row in cursor.fetchall()]
+    await cursor.execute("exec test_cursor_messages")
+    vals = [row[0] for row in await cursor.fetchall()]
     assert vals == ['Field 1a', 'Field 1b']
     msgs = [
         re.search(r'Message \d[ab]$', m[1]).group(0)
@@ -1199,15 +1205,15 @@ def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
     assert msgs == ['Message 1a', 'Message 1b']
 
     # result set 2: rows, no messages
-    assert cursor.nextset()
-    vals = [row[0] for row in cursor.fetchall()]
+    assert await cursor.nextset()
+    vals = [row[0] for row in await cursor.fetchall()]
     assert vals == ['Field 2a', 'Field 2b']
     assert not cursor.messages
 
     # result set 3: messages, no rows
-    assert cursor.nextset()
+    assert await cursor.nextset()
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.fetchall()
+        await cursor.fetchall()
     msgs = [
         re.search(r'Message \d[ab]$', m[1]).group(0)
         for m in cursor.messages
@@ -1215,13 +1221,13 @@ def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
     assert msgs == ['Message 2a', 'Message 2b']
 
     # result set 4: no rows, no messages
-    assert not cursor.nextset()
+    assert not await cursor.nextset()
     with pytest.raises(pyodbc.ProgrammingError):
-        cursor.fetchall()
+        await cursor.fetchall()
     assert not cursor.messages
 
 
-def test_none_param(cursor: pyodbc.Cursor):
+async def test_none_param(cursor: pyodbc.Cursor):
     "Ensure None can be used for params other than the first"
     # Some driver/db versions would fail if NULL was not the first parameter because
     # SQLDescribeParam (only used with NULL) could not be used after the first call to
@@ -1231,15 +1237,15 @@ def test_none_param(cursor: pyodbc.Cursor):
     # If SQLDescribeParam doesn't work, pyodbc would use VARCHAR which almost always worked.
     # However, binary/varbinary won't allow an implicit conversion.
 
-    cursor.execute("create table t1(n int, blob varbinary(max))")
-    cursor.execute("insert into t1 values (1, newid())")
-    row = cursor.execute("select * from t1").fetchone()
+    await cursor.execute("create table t1(n int, blob varbinary(max))")
+    await cursor.execute("insert into t1 values (1, newid())")
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert row.n == 1
     assert isinstance(row.blob, bytes)
 
     sql = "update t1 set n=?, blob=?"
     try:
-        cursor.execute(sql, 2, None)
+        await cursor.execute(sql, 2, None)
     except pyodbc.DataError:
         if IS_FREETDS:
             # cnxn.getinfo(pyodbc.SQL_DESCRIBE_PARAMETER) returns False for FreeTDS, so pyodbc
@@ -1249,15 +1255,15 @@ def test_none_param(cursor: pyodbc.Cursor):
             #
             # So at least verify that the user can manually specify the parameter type
             cursor.setinputsizes([(), (pyodbc.SQL_VARBINARY, None, None)])
-            cursor.execute(sql, 2, None)
+            await cursor.execute(sql, 2, None)
         else:
             raise
-    row = cursor.execute("select * from t1").fetchone()
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert row.n == 2
     assert row.blob is None
 
 
-def test_output_conversion():
+async def test_output_conversion():
     def convert1(value):
         # The value is the raw bytes (as a bytes object) read from the
         # database.  We'll simply add an X at the beginning at the end.
@@ -1267,90 +1273,90 @@ def test_output_conversion():
         # Same as above, but add a Y at the beginning at the end.
         return 'Y' + value.decode('latin1') + 'Y'
 
-    cnxn = connect()
+    cnxn = await connect()
     cursor = cnxn.cursor()
 
-    cursor.execute("create table t1(n int, v varchar(10))")
-    cursor.execute("insert into t1 values (1, '123.45')")
+    await cursor.execute("create table t1(n int, v varchar(10))")
+    await cursor.execute("insert into t1 values (1, '123.45')")
 
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
     # Clear all conversions and try again.  There should be no Xs this time.
     cnxn.clear_output_converters()
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
     # Same but clear using remove_output_converter.
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
     cnxn.remove_output_converter(pyodbc.SQL_VARCHAR)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
     # Clear via add_output_converter, passing None for the converter function.
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, None)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
     # retrieve and temporarily replace converter (get_output_converter)
     #
     #   case_1: converter already registered
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
     prev_converter = cnxn.get_output_converter(pyodbc.SQL_VARCHAR)
     assert prev_converter is not None
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert2)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'Y123.45Y'
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, prev_converter)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
     #
     #   case_2: no converter already registered
     cnxn.clear_output_converters()
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
     prev_converter = cnxn.get_output_converter(pyodbc.SQL_VARCHAR)
     assert prev_converter is None
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert2)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'Y123.45Y'
     cnxn.add_output_converter(pyodbc.SQL_VARCHAR, prev_converter)
-    value = cursor.execute("select v from t1").fetchone()[0]
+    value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
 
-def test_too_large(cursor: pyodbc.Cursor):
+async def test_too_large(cursor: pyodbc.Cursor):
     """Ensure error raised if insert fails due to truncation"""
     value = 'x' * 1000
-    cursor.execute("create table t1(s varchar(800))")
+    await cursor.execute("create table t1(s varchar(800))")
 
     with pytest.raises(pyodbc.Error):
-        cursor.execute("insert into t1 values (?)", value)
+        await cursor.execute("insert into t1 values (?)", value)
 
 
-def test_row_equal(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(n int, s varchar(20))")
-    cursor.execute("insert into t1 values (1, 'test')")
-    row1 = cursor.execute("select n, s from t1").fetchone()
-    row2 = cursor.execute("select n, s from t1").fetchone()
+async def test_row_equal(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(n int, s varchar(20))")
+    await cursor.execute("insert into t1 values (1, 'test')")
+    row1 = await (await cursor.execute("select n, s from t1")).fetchone()
+    row2 = await (await cursor.execute("select n, s from t1")).fetchone()
     assert row1 == row2
 
 
-def test_row_gtlt(cursor: pyodbc.Cursor):
-    cursor.execute("create table t1(n int, s varchar(20))")
-    cursor.execute("insert into t1 values (1, 'test1')")
-    cursor.execute("insert into t1 values (1, 'test2')")
-    rows = cursor.execute("select n, s from t1 order by s").fetchall()
+async def test_row_gtlt(cursor: pyodbc.Cursor):
+    await cursor.execute("create table t1(n int, s varchar(20))")
+    await cursor.execute("insert into t1 values (1, 'test1')")
+    await cursor.execute("insert into t1 values (1, 'test2')")
+    rows = await (await cursor.execute("select n, s from t1 order by s")).fetchall()
     assert rows[0] < rows[1]
     assert rows[0] <= rows[1]
     assert rows[1] > rows[0]
@@ -1361,62 +1367,62 @@ def test_row_gtlt(cursor: pyodbc.Cursor):
     rows.sort()  # uses <
 
 
-def test_context_manager_success():
+async def test_context_manager_success():
     "Ensure `with` commits if an exception is not raised"
-    cnxn = connect()
+    cnxn = await connect()
     cursor = cnxn.cursor()
 
-    cursor.execute("create table t1(n int)")
-    cnxn.commit()
+    await cursor.execute("create table t1(n int)")
+    await cnxn.commit()
 
-    with cnxn:
-        cursor.execute("insert into t1 values (1)")
+    async with cnxn:
+        await cursor.execute("insert into t1 values (1)")
 
-    rows = cursor.execute("select n from t1").fetchall()
+    rows = await (await cursor.execute("select n from t1")).fetchall()
     assert len(rows) == 1
     assert rows[0][0] == 1
 
 
-def test_context_manager_failure(cursor: pyodbc.Cursor):
+async def test_context_manager_failure(cursor: pyodbc.Cursor):
     "Ensure `with` rolls back if an exception is raised"
-    cnxn = connect()
+    cnxn = await connect()
     cursor = cnxn.cursor()
 
     # We'll insert a row and commit it.  Then we'll insert another row followed by an
     # exception.
 
-    cursor.execute("create table t1(n int)")
-    cursor.execute("insert into t1 values (1)")
-    cnxn.commit()
+    await cursor.execute("create table t1(n int)")
+    await cursor.execute("insert into t1 values (1)")
+    await cnxn.commit()
 
     with pytest.raises(pyodbc.Error):
-        with cnxn:
-            cursor.execute("insert into t1 values (2)")
-            cursor.execute("delete from bogus")
+        async with cnxn:
+            await cursor.execute("insert into t1 values (2)")
+            await cursor.execute("delete from bogus")
 
-    cursor.execute("select max(n) from t1")
-    val = cursor.fetchval()
+    await cursor.execute("select max(n) from t1")
+    val = await cursor.fetchval()
     assert val == 1
 
 
-def test_untyped_none(cursor: pyodbc.Cursor):
+async def test_untyped_none(cursor: pyodbc.Cursor):
     # From issue 129
-    value = cursor.execute("select ?", None).fetchone()[0]
+    value = (await (await cursor.execute("select ?", None)).fetchone())[0]
     assert value is None
 
 
-def test_large_update_nodata(cursor: pyodbc.Cursor):
-    cursor.execute('create table t1(a varbinary(max))')
+async def test_large_update_nodata(cursor: pyodbc.Cursor):
+    await cursor.execute('create table t1(a varbinary(max))')
     hundredkb = b'x' * 100 * 1024
-    cursor.execute('update t1 set a=? where 1=0', (hundredkb,))
+    await cursor.execute('update t1 set a=? where 1=0', (hundredkb,))
 
 
-def test_func_param(cursor: pyodbc.Cursor):
+async def test_func_param(cursor: pyodbc.Cursor):
     try:
-        cursor.execute("drop function func1")
+        await cursor.execute("drop function func1")
     except Exception:
         pass
-    cursor.execute("""
+    await cursor.execute("""
                    create function func1 (@testparam varchar(4))
                    returns @rettest table (param varchar(4))
                    as
@@ -1426,12 +1432,12 @@ def test_func_param(cursor: pyodbc.Cursor):
                        return
                    end
                    """)
-    cursor.commit()
-    value = cursor.execute("select * from func1(?)", 'test').fetchone()[0]
+    await cursor.commit()
+    value = (await (await cursor.execute("select * from func1(?)", 'test')).fetchone())[0]
     assert value == 'test'
 
 
-def test_columns(cursor: pyodbc.Cursor):
+async def test_columns(cursor: pyodbc.Cursor):
     # When using aiohttp, `await cursor.primaryKeys('t1')` was raising the error
     #
     #   Error: TypeError: argument 2 must be str, not None
@@ -1439,10 +1445,10 @@ def test_columns(cursor: pyodbc.Cursor):
     # I'm not sure why, but PyArg_ParseTupleAndKeywords fails if you use "|s" for an
     # optional string keyword when calling indirectly.
 
-    cursor.execute("create table t1(a int, b varchar(3), xΏz varchar(4))")
+    await cursor.execute("create table t1(a int, b varchar(3), xΏz varchar(4))")
 
-    cursor.columns('t1')
-    results = {row.column_name: row for row in cursor}
+    await cursor.columns('t1')
+    results = {row.column_name: row async for row in cursor}
     row = results['a']
     assert row.type_name == 'int', row.type_name
     row = results['b']
@@ -1453,8 +1459,8 @@ def test_columns(cursor: pyodbc.Cursor):
     # were parsing arguments incorrectly and would raise an error.  (This crops up when
     # calling indirectly like columns(*args, **kwargs) which aiodbc does.)
 
-    cursor.columns('t1', schema=None, catalog=None)
-    results = {row.column_name: row for row in cursor}
+    await cursor.columns('t1', schema=None, catalog=None)
+    results = {row.column_name: row async for row in cursor}
     row = results['a']
     assert row.type_name == 'int', row.type_name
     row = results['b']
@@ -1467,32 +1473,32 @@ def test_columns(cursor: pyodbc.Cursor):
     for i in range(8, 16):
         table_name = 'pyodbc_89abcdef'[:i]
 
-        cursor.execute(f"""
+        await cursor.execute(f"""
           IF OBJECT_ID (N'{table_name}', N'U') IS NOT NULL DROP TABLE {table_name};
           CREATE TABLE {table_name} (id INT PRIMARY KEY);
         """)
 
-        col_count = len([col.column_name for col in cursor.columns(table_name)])
+        col_count = len([col.column_name async for col in await cursor.columns(table_name)])
         assert col_count == 1
 
-        cursor.execute(f"drop table {table_name}")
+        await cursor.execute(f"drop table {table_name}")
 
 
-def test_table_privileges(cursor: pyodbc.Cursor):
+async def test_table_privileges(cursor: pyodbc.Cursor):
     # Confirm exposure of SQLTablePrivileges.  We're limited in what we can test, as
     # we can't control whether we're running with permission to create users or grant
     # permissions.  We can at least verify that the method generates a results set
     # with the right columns.
     cols = ["table_cat", "table_schem", "table_name", "grantor",
             "grantee", "privilege", "is_grantable"]
-    cursor.tablePrivileges()
+    await cursor.tablePrivileges()
     names = [col[0] for col in cursor.description]
     assert len(cols) == len(names), "privileges results set has the wrong shape"
     assert cols == names, "unexpected column names for privileges results set"
 
 
 @pytest.mark.skipif(IS_FREETDS, reason="FreeTDS Unicode handling for catalog functions is unreliable")
-def test_statistics_unicode():
+async def test_statistics_unicode():
     # https://github.com/mkleehammer/pyodbc/issues/1457
     # statistics() passed the table name straight to the ANSI SQLStatistics, mis-encoding a
     # non-ASCII name so the driver matched nothing and returned no rows.  The failure is
@@ -1502,28 +1508,29 @@ def test_statistics_unicode():
     # table name for good measure.
     suffix = uuid.uuid4().hex
     name = "ランドマーク_" + suffix
-    cnxn = pyodbc.connect(CNXNSTR + f";APP=pyodbc_1457_{suffix}", autocommit=True)
+    cnxn = await pyodbc.connect(CNXNSTR + f";APP=pyodbc_1457_{suffix}", autocommit=True)
     cur = cnxn.cursor()
-    cur.execute(f"CREATE TABLE [{name}] (id INT PRIMARY KEY, foo INT)")
-    cur.execute(f"CREATE INDEX ix_foo ON [{name}] (foo)")
+    await cur.execute(f"CREATE TABLE [{name}] (id INT PRIMARY KEY, foo INT)")
+    await cur.execute(f"CREATE INDEX ix_foo ON [{name}] (foo)")
     try:
         # index_name is column 5 of the SQLStatistics result set
-        index_names = {row[5] for row in cur.statistics(name).fetchall() if row[5] is not None}
+        index_names = {row[5] for row in await (await cur.statistics(name)).fetchall()
+                       if row[5] is not None}
         assert "ix_foo" in index_names, \
             f"statistics() returned no index info for a Unicode table name; got {index_names}"
     finally:
-        cur.execute(f"IF OBJECT_ID(N'[{name}]', N'U') IS NOT NULL DROP TABLE [{name}]")
-        cnxn.close()
+        await cur.execute(f"IF OBJECT_ID(N'[{name}]', N'U') IS NOT NULL DROP TABLE [{name}]")
+        await cnxn.close()
 
 
-def test_cancel(cursor: pyodbc.Cursor):
+async def test_cancel(cursor: pyodbc.Cursor):
     # I'm not sure how to reliably cause a hang to cancel, so for now we'll settle with
     # making sure SQLCancel is called correctly.
-    cursor.execute("select 1")
+    await cursor.execute("select 1")
     cursor.cancel()
 
 
-def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
+async def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
     # https://github.com/mkleehammer/pyodbc/issues/423
     #
     # When sending a varchar parameter, pyodbc is supposed to set ColumnSize to the number
@@ -1533,15 +1540,15 @@ def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
 
     v = "x \U0001F31C z"
 
-    cursor.execute("create table t1(s nvarchar(100))")
-    cursor.execute("insert into t1 values (?)", v)
+    await cursor.execute("create table t1(s nvarchar(100))")
+    await cursor.execute("insert into t1 values (?)", v)
 
-    result = cursor.execute("select s from t1").fetchone()[0]
+    result = (await (await cursor.execute("select s from t1")).fetchone())[0]
 
     assert result == v
 
 
-def test_emoticons_as_literal(cursor: pyodbc.Cursor):
+async def test_emoticons_as_literal(cursor: pyodbc.Cursor):
     # similar to `test_emoticons_as_parameter`, above, except for Unicode literal
     #
     # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
@@ -1551,15 +1558,15 @@ def test_emoticons_as_literal(cursor: pyodbc.Cursor):
 
     v = "x \U0001F31C z"
 
-    cursor.execute("create table t1(s nvarchar(100))")
-    cursor.execute(f"insert into t1 values (N'{v}')")
+    await cursor.execute("create table t1(s nvarchar(100))")
+    await cursor.execute(f"insert into t1 values (N'{v}')")
 
-    result = cursor.execute("select s from t1").fetchone()[0]
+    result = (await (await cursor.execute("select s from t1")).fetchone())[0]
 
     assert result == v
 
 
-def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
+async def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
     # Test table value parameters (TVP).  I like the explanation here:
     #
     # https://www.mssqltips.com/sqlservertip/1483/using-table-valued-parameters-tvp-in-sql-server/
@@ -1589,25 +1596,25 @@ def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
 
     # (Don't use "if exists" since older SQL Servers don't support it.)
     try:
-        cursor.execute("drop procedure " + procname)
+        await cursor.execute("drop procedure " + procname)
     except Exception:
         pass
     try:
-        cursor.execute("drop type " + typename)
+        await cursor.execute("drop type " + typename)
     except Exception:
         pass
     if diff_schema:
         try:
-            cursor.execute("drop schema " + schemaname)
+            await cursor.execute("drop schema " + schemaname)
         except Exception:
             pass
-    cursor.commit()
+    await cursor.commit()
 
     if diff_schema:
-        cursor.execute("CREATE SCHEMA myschema")
-        cursor.commit()
+        await cursor.execute("CREATE SCHEMA myschema")
+        await cursor.commit()
 
-    cursor.execute(
+    await cursor.execute(
         f"""
         CREATE TYPE {typename} AS TABLE(
                 c01 VARCHAR(255),
@@ -1623,13 +1630,13 @@ def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
                 c11 NUMERIC(38, 24),
                 c12 UNIQUEIDENTIFIER)
         """)
-    cursor.commit()
-    cursor.execute(
+    await cursor.commit()
+    await cursor.execute(
         f"""
         CREATE PROCEDURE {procname} @TVP {typename} READONLY
           AS SELECT * FROM @TVP;
         """)
-    cursor.commit()
+    await cursor.commit()
 
     # The values aren't exactly VERY_LONG_LEN but close enough and *significantly* faster than
     # the loop we had before.
@@ -1678,7 +1685,9 @@ def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
     saved_native_uuid = pyodbc.native_uuid
     try:
         pyodbc.native_uuid = True
-        result_array = [tuple(row) for row in cursor.execute(f"exec {procname} ?", p1).fetchall()]
+        result_array = [
+            tuple(row)
+            for row in await (await cursor.execute(f"exec {procname} ?", p1)).fetchall()]
     finally:
         pyodbc.native_uuid = saved_native_uuid
 
@@ -1698,36 +1707,36 @@ def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
         p1 = [[typenameonly, schemaname] + params]
     else:
         p1 = [params]
-    result_array = cursor.execute(f"exec {procname} ?", p1).fetchall()
+    result_array = await (await cursor.execute(f"exec {procname} ?", p1)).fetchall()
     assert result_array == params
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-def test_tvp(cursor: pyodbc.Cursor):
-    _test_tvp(cursor, False)
+async def test_tvp(cursor: pyodbc.Cursor):
+    await _test_tvp(cursor, False)
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-def test_tvp_diffschema(cursor: pyodbc.Cursor):
-    _test_tvp(cursor, True)
+async def test_tvp_diffschema(cursor: pyodbc.Cursor):
+    await _test_tvp(cursor, True)
 
 
-def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
+async def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
     # Make sure we check all the rows of the TVP before binding.
     # Splitting into multiple tests to prevent one failure from
     # masking other problems.
     procname = "SelectFromScannedTVP"
     typename = "TestTVPForScanning"
     try:
-        cursor.execute(f"DROP PROCEDURE {procname}")
+        await cursor.execute(f"DROP PROCEDURE {procname}")
     except pyodbc.ProgrammingError:
         pass
     try:
-        cursor.execute(f"DROP TYPE {typename}")
+        await cursor.execute(f"DROP TYPE {typename}")
     except pyodbc.ProgrammingError:
         pass
-    cursor.execute(f"CREATE TYPE {typename} AS TABLE(val DECIMAL(20,4))")
-    cursor.execute(f"""\
+    await cursor.execute(f"CREATE TYPE {typename} AS TABLE(val DECIMAL(20,4))")
+    await cursor.execute(f"""\
         CREATE PROCEDURE {procname}
             @TVP {typename} READONLY
         AS
@@ -1736,48 +1745,48 @@ def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
             SELECT * FROM @TVP;
         END
         """)
-    cursor.commit()
-    cursor.execute(f"EXEC {procname} ?", [data])
-    results = [list(row) for row in cursor.fetchall()]
+    await cursor.commit()
+    await cursor.execute(f"EXEC {procname} ?", [data])
+    results = [list(row) for row in await cursor.fetchall()]
     assert results == data
-    cursor.execute(f"DROP PROCEDURE {procname}")
-    cursor.execute(f"DROP TYPE {typename}")
-    cursor.commit()
+    await cursor.execute(f"DROP PROCEDURE {procname}")
+    await cursor.execute(f"DROP TYPE {typename}")
+    await cursor.commit()
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-def test_tvp_decimal_mixed_precision(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_precision(cursor: pyodbc.Cursor):
     """Test for https://github.com/mkleehammer/pyodbc/issues/996."""
-    _test_scanning_all_tvp_rows(cursor, [[Decimal("4.0000")], [Decimal("25.000")]])
+    await _test_scanning_all_tvp_rows(cursor, [[Decimal("4.0000")], [Decimal("25.000")]])
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-def test_tvp_decimal_mixed_scale(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_scale(cursor: pyodbc.Cursor):
     """Test the different number decimal digits, but same number of integer digits."""
-    _test_scanning_all_tvp_rows(cursor, [[Decimal("4.000")], [Decimal("4.0000")]])
+    await _test_scanning_all_tvp_rows(cursor, [[Decimal("4.000")], [Decimal("4.0000")]])
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-def test_tvp_decimal_mixed_shape(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_shape(cursor: pyodbc.Cursor):
     """Test same number of digits, shifting decimal point.
 
     See the lengthy comment in the code for BindTVPColumns().
     """
-    _test_scanning_all_tvp_rows(cursor, [[Decimal("4.0000")], [Decimal("40.000")]])
-    _test_scanning_all_tvp_rows(cursor, [[Decimal("40.000")], [Decimal("4.0000")]])
+    await _test_scanning_all_tvp_rows(cursor, [[Decimal("4.0000")], [Decimal("40.000")]])
+    await _test_scanning_all_tvp_rows(cursor, [[Decimal("40.000")], [Decimal("4.0000")]])
 
 
-def _test_tvp_with_nulls_cleanup(cursor: pyodbc.Cursor, procname: str, typename: str):
+async def _test_tvp_with_nulls_cleanup(cursor: pyodbc.Cursor, procname: str, typename: str):
     """Leave the forest as pristine as you found it."""
 
-    cursor.execute(f"""\
+    await cursor.execute(f"""\
         IF OBJECT_ID(N'dbo.{procname}', N'P') IS NOT NULL
         DROP PROCEDURE dbo.{procname};
     """)
-    cursor.execute(f"""
+    await cursor.execute(f"""
         IF TYPE_ID(N'dbo.{typename}') IS NOT NULL
             DROP TYPE dbo.{typename};
     """)
@@ -1785,19 +1794,19 @@ def _test_tvp_with_nulls_cleanup(cursor: pyodbc.Cursor, procname: str, typename:
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason="FreeTDS does not support TVP")
-def test_tvp_with_nulls(cursor: pyodbc.Cursor):
+async def test_tvp_with_nulls(cursor: pyodbc.Cursor):
     """Make sure NULL values in a TVP don't crash the interpreter."""
 
     # Start with a clean slate.
     typename = "typeTestNullsInTVP"
     procname = "spTestNullsInTVP"
-    _test_tvp_with_nulls_cleanup(cursor, procname, typename)
+    await _test_tvp_with_nulls_cleanup(cursor, procname, typename)
 
     # Create the custom type and stored procedure.
     ncols = 100
     cols = ", ".join([f"col_{c:03d} DECIMAL(36,20)" for c in range(1, ncols+1)])
-    cursor.execute(f"CREATE TYPE dbo.{typename} AS TABLE ({cols})")
-    cursor.execute(f"""\
+    await cursor.execute(f"CREATE TYPE dbo.{typename} AS TABLE ({cols})")
+    await cursor.execute(f"""\
         CREATE PROCEDURE dbo.{procname}
             @data dbo.{typename} READONLY
         AS
@@ -1805,34 +1814,34 @@ def test_tvp_with_nulls(cursor: pyodbc.Cursor):
             RETURN 0;
         END;
     """)
-    cursor.commit()
+    await cursor.commit()
 
     # Invoke the stored procedure.
     tvp: list[list] = [[3.14159] * ncols, [None] * ncols]
-    cursor.execute(f"EXEC [dbo].{procname} @data=?", [tvp])
+    await cursor.execute(f"EXEC [dbo].{procname} @data=?", [tvp])
     gc.collect()
 
     # Be a good digital citizen.
-    _test_tvp_with_nulls_cleanup(cursor, procname, typename)
-    cursor.commit()
+    await _test_tvp_with_nulls_cleanup(cursor, procname, typename)
+    await cursor.commit()
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2000, reason='sql_variant not supported until 2000')
-def test_sql_variant(cursor: pyodbc.Cursor):
+async def test_sql_variant(cursor: pyodbc.Cursor):
     """
     Tests decoding of the sql_variant data type as performed by the GetData_SqlVariant() method.
     """
 
-    cursor.execute("create table t1 (a sql_variant)")
+    await cursor.execute("create table t1 (a sql_variant)")
 
     # insert a number of values of disparate types. this is not exhaustive as not all
     # types that can be contained within a sql_variant field are supported by pyodbc
-    cursor.execute("insert into t1 values (456.7)")
-    cursor.execute("insert into t1 values ('a string')")
-    cursor.execute("insert into t1 values (CAST('2024-06-03' AS DATE))")
-    cursor.execute("insert into t1 values (CAST('2024-06-03 23:46:03.000' AS DATETIME))")
-    cursor.execute("insert into t1 values (CAST('binary data' AS VARBINARY(200)))")
-    cursor.execute(
+    await cursor.execute("insert into t1 values (456.7)")
+    await cursor.execute("insert into t1 values ('a string')")
+    await cursor.execute("insert into t1 values (CAST('2024-06-03' AS DATE))")
+    await cursor.execute("insert into t1 values (CAST('2024-06-03 23:46:03.000' AS DATETIME))")
+    await cursor.execute("insert into t1 values (CAST('binary data' AS VARBINARY(200)))")
+    await cursor.execute(
         "insert into t1 values (CAST('0592b437-745f-4b2c-a997-97022c624cf6' AS UNIQUEIDENTIFIER))"
     )
 
@@ -1840,7 +1849,8 @@ def test_sql_variant(cursor: pyodbc.Cursor):
     saved_native_uuid = pyodbc.native_uuid
     try:
         pyodbc.native_uuid = True
-        results = [record[0] for record in cursor.execute("select a from t1").fetchall()]
+        results = [record[0] for record in
+                   await (await cursor.execute("select a from t1")).fetchall()]
     finally:
         pyodbc.native_uuid = saved_native_uuid
 
@@ -1862,16 +1872,16 @@ def test_sql_variant(cursor: pyodbc.Cursor):
         assert results[index] == expected_value
 
 
-def test_rows_as_dicts(cursor: pyodbc.Cursor):
+async def test_rows_as_dicts(cursor: pyodbc.Cursor):
     """Test enhancement for ticket #171"""
 
     # Create and populate a test table.
-    cursor.execute("create table t1 (id int, name varchar(20))")
-    cursor.execute("insert into t1 values (42, 'Kathleen')")
+    await cursor.execute("create table t1 (id int, name varchar(20))")
+    await cursor.execute("insert into t1 values (42, 'Kathleen')")
 
     # Verify the default behavior
     assert cursor.rows_as_dicts is False
-    row = cursor.execute("select * from t1").fetchone()
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert not isinstance(row, dict)
     assert isinstance(row, pyodbc.Row)
     assert isinstance(row[0], int)
@@ -1882,7 +1892,7 @@ def test_rows_as_dicts(cursor: pyodbc.Cursor):
 
     # Test the dict option
     cursor.rows_as_dicts = True
-    row = cursor.execute("select * from t1").fetchone()
+    row = await (await cursor.execute("select * from t1")).fetchone()
     assert not isinstance(row, pyodbc.Row)
     assert isinstance(row, dict)
     assert row == {"id": 42, "name": "Kathleen"}
@@ -1893,19 +1903,19 @@ def test_rows_as_dicts(cursor: pyodbc.Cursor):
         print(row[1])
 
     # Test aliasing
-    row = cursor.execute("select name as n1, name as n2 from t1").fetchone()
+    row = await (await cursor.execute("select name as n1, name as n2 from t1")).fetchone()
     assert len(row) == 2
     assert row == {"n1": "Kathleen", "n2": "Kathleen"}
     with pytest.raises(KeyError):
         print(row["name"])
 
     # Test with a duplicate name
-    row = cursor.execute("select name, name from t1").fetchone()
+    row = await (await cursor.execute("select name, name from t1")).fetchone()
     assert len(row) == 1
     assert row == {"name": "Kathleen"}
 
 
-def test_handles(cursor: pyodbc.Cursor):
+async def test_handles(cursor: pyodbc.Cursor):
     """Test the exposed native ODBC handles"""
 
     conn = cursor.connection
@@ -1914,22 +1924,22 @@ def test_handles(cursor: pyodbc.Cursor):
         with pytest.raises(TypeError):
             if handle > 42:
                 print("we should never get here")
-    cursor.close()
+    await cursor.close()
     assert not isinstance(cursor.hstmt, ctypes.c_void_p)
     assert cursor.hstmt is None
     assert isinstance(conn.hdbc, ctypes.c_void_p)
-    conn.close()
+    await conn.close()
     assert not isinstance(conn.hdbc, ctypes.c_void_p)
     assert conn.hdbc is None
 
 
-def get_sqlserver_version(cursor: pyodbc.Cursor):
+async def get_sqlserver_version(cursor: pyodbc.Cursor):
 
     """
     Returns the major version: 8-->2000, 9-->2005, 10-->2008
     """
-    cursor.execute("exec master..xp_msver 'ProductVersion'")
-    row = cursor.fetchone()
+    await cursor.execute("exec master..xp_msver 'ProductVersion'")
+    row = await cursor.fetchone()
     return int(row.Character_Value.split('.', 1)[0])
 
 
@@ -1969,13 +1979,13 @@ def _generate_str(length, encoding=None):
     return v
 
 
-def test_set_string_attr(cursor: pyodbc.Cursor):
+async def test_set_string_attr(cursor: pyodbc.Cursor):
     """Confirm that set_attr() now accepts string values.
 
     See https://github.com/mkleehammer/pyodbc/issues/505
     """
-    original_db = cursor.execute("SELECT db_name()").fetchval()
+    original_db = await (await cursor.execute("SELECT db_name()")).fetchval()
     assert original_db != "master"
-    cursor.connection.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, "master")
-    new_db = cursor.execute("SELECT db_name()").fetchval()
+    await cursor.connection.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, "master")
+    new_db = await (await cursor.execute("SELECT db_name()")).fetchval()
     assert new_db == "master"

@@ -32,6 +32,11 @@ classifiers=['Development Status :: 5 - Production/Stable',
 [project.urls]
 Homepage = "https://github.com/mkleehammer/pyodbc"
 
+[tool.pytest.ini_options]
+# The test suites are async (see docs/rust-asyncio-rewrite-plan.md); auto mode lets
+# plain "async def" tests and fixtures run without per-test markers.
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"

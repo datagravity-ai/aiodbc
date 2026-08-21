@@ -2,6 +2,7 @@
 // ODBC call is enqueued on the parent connection's worker and returned to Python as
 // an asyncio future.  The HSTMT is allocated lazily on first use.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -37,8 +38,6 @@ fn no_results_err() -> PyErr {
 #[derive(Clone)]
 pub struct ColInfo {
     pub sql_type: i16,
-    // Used from phase 3 on (readvar buffer sizing); carried in the description now.
-    #[allow(dead_code)]
     pub column_size: u64,
 }
 
@@ -69,6 +68,7 @@ pub struct Cursor {
     connection: Py<Connection>,
     shared: Arc<Mutex<CursorShared>>,
     closed: bool,
+    readvar_initsize: Arc<AtomicUsize>,
     #[pyo3(get, set)]
     arraysize: usize,
 }
@@ -102,12 +102,17 @@ fn extract_param_row(row: &Bound<'_, PyAny>) -> PyResult<Vec<ParamValue>> {
 }
 
 impl Cursor {
-    pub fn new(tx: Sender<Task>, connection: Py<Connection>) -> Self {
+    pub fn new(
+        tx: Sender<Task>,
+        connection: Py<Connection>,
+        readvar_initsize: Arc<AtomicUsize>,
+    ) -> Self {
         Cursor {
             tx,
             connection,
             shared: Arc::new(Mutex::new(CursorShared::default())),
             closed: false,
+            readvar_initsize,
             arraysize: 1,
         }
     }
@@ -198,6 +203,7 @@ impl Cursor {
     fn fetch_future(&self, py: Python<'_>, mode: FetchMode) -> PyResult<Py<PyAny>> {
         self.validate(py)?;
         let shared = self.shared.clone();
+        let initsize = self.readvar_initsize.load(Ordering::Relaxed);
 
         dispatch_future(py, &self.tx, move |_state| {
             let (hstmt, colinfos) = {
@@ -239,7 +245,7 @@ impl Cursor {
                 }
                 let mut cells = Vec::with_capacity(colinfos.len());
                 for (i, info) in colinfos.iter().enumerate() {
-                    cells.push(getdata::get_data(hstmt, i, info, &on_err)?);
+                    cells.push(getdata::get_data(hstmt, i, info, initsize, &on_err)?);
                 }
                 rows.push(cells);
             }
