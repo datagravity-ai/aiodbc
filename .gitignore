@@ -66,3 +66,6 @@ test.mdb
 
 # Claude Code scratch space (throwaway repro scripts, experiments) — never committed
 /.claude/scratch/
+
+# Rust build output
+/target/

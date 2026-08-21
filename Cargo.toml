@@ -1,0 +1,16 @@
+[package]
+name = "pyodbc"
+# The canonical version is in pyproject.toml (see CLAUDE.md); maturin uses that
+# for wheel metadata.  This one is not surfaced anywhere.
+version = "5.4.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+path = "rust/lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
+odbc-sys = "0.25"

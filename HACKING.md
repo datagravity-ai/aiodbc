@@ -1,5 +1,21 @@
 
 
+# Rust rewrite (in progress)
+
+pyodbc is being rewritten in Rust with an asyncio-native API; the plan and current
+status live in docs/rust-asyncio-rewrite-plan.md.  The Rust core is in rust/ (built
+by Cargo.toml + maturin into `pyodbc._core`), and the public package is assembled in
+python/pyodbc/.  `pip install .` now builds the Rust module.  Fast development loop
+(requires a Rust toolchain and unixODBC headers, e.g. unixodbc-dev):
+
+    pip install maturin
+    maturin develop        # build + install into the active virtualenv
+    pytest tests/sqlite_test.py -vxk test_text
+
+The C++ sources in src/ remain the reference implementation until the port reaches
+parity and can still be built directly with setuptools as described below.
+
+
 # Development Testing
 
 We use tox for complete testing, but when you are in the middle of development you need fast
