@@ -151,9 +151,9 @@ def connect(connstring=None, /, **kwargs):
             core_kwargs['encoding'] = value
         elif key == 'attrs_before':
             if value is not None:
-                raise NotImplementedError(
-                    'attrs_before is not implemented in the Rust port yet '
-                    '(phase 5 of docs/rust-asyncio-rewrite-plan.md)')
+                if not isinstance(value, dict):
+                    raise TypeError('attrs_before must be a dict')
+                core_kwargs['attrs_before'] = value
         elif key == 'driver_completion':
             value = int(value)
             if value not in _VALID_DRIVER_COMPLETION:

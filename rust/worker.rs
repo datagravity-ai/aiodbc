@@ -55,6 +55,10 @@ pub struct ConnState {
     pub hdbc_public: Arc<AtomicUsize>,
     /// Driver capabilities probed at connect.
     pub cnxninfo: CnxnInfo,
+    /// Buffers handed to the driver via pre-connect SQLSetConnectAttr.  Some
+    /// drivers keep reading them after the call returns (pyodbc issue #1469), so
+    /// they live as long as the connection.
+    pub preconn_keepalive: Vec<Vec<u8>>,
 }
 
 impl ConnState {
@@ -100,6 +104,7 @@ pub fn spawn(autocommit: Arc<AtomicBool>, hdbc_public: Arc<AtomicUsize>) -> PyRe
                 autocommit,
                 hdbc_public,
                 cnxninfo: CnxnInfo::default(),
+                preconn_keepalive: Vec::new(),
             };
             while let Ok(task) = rx.recv() {
                 if !task(&mut state) {

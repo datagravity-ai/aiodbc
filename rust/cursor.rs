@@ -72,7 +72,6 @@ enum MsgText {
 
 /// State shared between the Cursor object and the tasks it enqueues.  ODBC fields
 /// are only touched on the worker; the Py fields are only touched under the GIL.
-#[derive(Default)]
 pub struct CursorShared {
     pub hstmt: usize,
     pub colinfos: Vec<ColInfo>,
@@ -80,6 +79,20 @@ pub struct CursorShared {
     pub name_map: Option<Py<PyDict>>,
     pub rowcount: i64,
     pub messages: Option<Py<PyAny>>,
+}
+
+impl Default for CursorShared {
+    fn default() -> Self {
+        CursorShared {
+            hstmt: 0,
+            colinfos: Vec::new(),
+            description: None,
+            name_map: None,
+            // The DB API value for "not in use" (Cursor_New in cursor.cpp).
+            rowcount: -1,
+            messages: None,
+        }
+    }
 }
 
 #[pyclass(module = "pyodbc")]
@@ -1241,7 +1254,7 @@ impl Cursor {
                 ));
             }
 
-            let mut rowcount: Len = 0;
+            let mut rowcount: Len = -1;
             let ret = unsafe { odbc_sys::SQLRowCount(hstmt, &mut rowcount) };
             if !succeeded(ret) {
                 return Err(error_from_handle(
@@ -1702,6 +1715,7 @@ fn execute_odbc(
 
     let mut diags: Vec<RawDiag> = Vec::new();
     let mut with_info = false;
+    let mut no_data = false;
     match rows {
         ExecuteRows::One(values) if values.is_empty() => {
             let ret = if ctx.sql_wide {
@@ -1724,6 +1738,7 @@ fn execute_odbc(
             if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                 return Err(on_err("SQLExecDirectW"));
             }
+            no_data = ret == SqlReturn::NO_DATA;
             with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
             if with_info {
                 diags.extend(collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag));
@@ -1748,6 +1763,7 @@ fn execute_odbc(
             if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                 return Err(on_err("SQLExecute"));
             }
+            no_data = ret == SqlReturn::NO_DATA;
             with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
             drop(bound); // buffers must outlive SQLExecute and the SQLPutData loop
         }
@@ -1808,7 +1824,16 @@ fn execute_odbc(
 
     let _ = with_info;
 
-    let mut rowcount: Len = 0;
+    // "A delete statement that did not delete anything": no result set, and a
+    // rowcount of 0 (the SQL_NO_DATA branch in cursor.cpp's execute).
+    if no_data {
+        return Ok((0, Vec::new(), diags));
+    }
+
+    // Initialized to -1 and possibly left that way: some drivers (psqlODBC on
+    // DDL) return success without writing the out-parameter, and the C++
+    // implementation's cRows started at -1.
+    let mut rowcount: Len = -1;
     let ret = unsafe { odbc_sys::SQLRowCount(hstmt, &mut rowcount) };
     if !succeeded(ret) {
         return Err(on_err("SQLRowCount"));

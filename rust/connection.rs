@@ -74,6 +74,7 @@ pub struct Connection {
     hdbc_public: Arc<AtomicUsize>,
     encodings: Arc<Mutex<ConnEncodings>>,
     converters: ConverterMap,
+    searchescape_cache: Arc<Mutex<Option<String>>>,
 }
 
 impl Connection {
@@ -206,6 +207,45 @@ impl Connection {
     #[getter]
     fn timeout(&self) -> u32 {
         self.timeout_cache.load(Ordering::Relaxed)
+    }
+
+    /// The driver's LIKE-pattern escape character, from
+    /// SQLGetInfo(SQL_SEARCH_PATTERN_ESCAPE), fetched once and cached
+    /// (Connection_getsearchescape in connection.cpp).
+    #[getter]
+    fn searchescape(&self, py: Python<'_>) -> PyResult<String> {
+        if let Some(cached) = self.searchescape_cache.lock().unwrap().clone() {
+            return Ok(cached);
+        }
+        const SQL_SEARCH_PATTERN_ESCAPE: u16 = 14;
+        let tx = self.channel()?;
+        let value = dispatch_sync(py, tx, move |state| {
+            if state.hdbc == 0 {
+                return Err(closed_connection_err());
+            }
+            let mut buffer = [0u8; 16];
+            let mut cch: i16 = 0;
+            let ret = unsafe {
+                RawSQLGetInfo(
+                    state.hdbc as HDbc,
+                    SQL_SEARCH_PATTERN_ESCAPE,
+                    buffer.as_mut_ptr() as Pointer,
+                    buffer.len() as i16,
+                    &mut cch,
+                )
+            };
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    "SQLGetInfo",
+                    HandleType::Dbc,
+                    state.hdbc as Handle,
+                ));
+            }
+            let len = (cch.max(0) as usize).min(buffer.len());
+            Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
+        })?;
+        *self.searchescape_cache.lock().unwrap() = Some(value.clone());
+        Ok(value)
     }
 
     #[setter]
@@ -636,6 +676,95 @@ fn probe_cnxninfo(hdbc: Handle) -> worker::CnxnInfo {
     info
 }
 
+/// One pre-connect attribute from connect(attrs_before=...), extracted under the
+/// GIL and applied on the worker before SQLDriverConnect (ApplyPreconnAttrs in
+/// connection.cpp).
+pub enum PreconnValue {
+    UInt(usize),
+    Int(isize),
+    /// bytes/bytearray, passed as SQL_IS_POINTER.
+    Bytes(Vec<u8>),
+    /// str encoded per the connect encoding (default UTF-16LE), passed as SQL_NTS.
+    Str(Vec<u8>),
+}
+
+pub struct PreconnAttr {
+    pub key: i32,
+    pub value: PreconnValue,
+}
+
+fn extract_preconn_value(
+    py: Python<'_>,
+    key: i32,
+    value: &Bound<'_, PyAny>,
+    strencoding: &str,
+    out: &mut Vec<PreconnAttr>,
+) -> PyResult<()> {
+    use pyo3::types::{PyByteArray, PyBytes, PyInt, PyList, PyString, PyTuple as PyTup};
+
+    if value.is_instance_of::<PyInt>() {
+        // Sign decides SQL_IS_UINTEGER vs SQL_IS_INTEGER, like ApplyPreconnAttrs.
+        let v: i128 = value.extract()?;
+        let value = if v >= 0 {
+            PreconnValue::UInt(v as usize)
+        } else {
+            PreconnValue::Int(v as isize)
+        };
+        out.push(PreconnAttr { key, value });
+        return Ok(());
+    }
+    if value.is_instance_of::<PyBytes>() || value.is_instance_of::<PyByteArray>() {
+        out.push(PreconnAttr {
+            key,
+            value: PreconnValue::Bytes(value.extract()?),
+        });
+        return Ok(());
+    }
+    if value.is_instance_of::<PyString>() {
+        let mut bytes: Vec<u8> = py
+            .import("codecs")?
+            .call_method1("encode", (value, strencoding, "strict"))?
+            .extract()?;
+        // The driver scans for the terminator (the length is SQL_NTS); make sure
+        // there is one whatever the encoding's unit size.
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        out.push(PreconnAttr {
+            key,
+            value: PreconnValue::Str(bytes),
+        });
+        return Ok(());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTup>() {
+        // A sequence sets the same attribute repeatedly, in order.
+        for item in value.try_iter()? {
+            extract_preconn_value(py, key, &item?, strencoding, out)?;
+        }
+        return Ok(());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "Unsupported attrs_before type: {}",
+        value.get_type().name()?
+    )))
+}
+
+/// Convert the attrs_before dict.  Non-int keys become attribute 0, matching the
+/// C++ implementation.
+fn extract_preconn_attrs(
+    py: Python<'_>,
+    attrs_before: &Bound<'_, PyAny>,
+    strencoding: &str,
+) -> PyResult<Vec<PreconnAttr>> {
+    let dict = attrs_before
+        .downcast::<pyo3::types::PyDict>()
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("attrs_before must be a dict"))?;
+    let mut out = Vec::new();
+    for (key, value) in dict.iter() {
+        let ikey: i32 = key.extract().unwrap_or(0);
+        extract_preconn_value(py, ikey, &value, strencoding, &mut out)?;
+    }
+    Ok(out)
+}
+
 fn driver_completion_from_int(value: i32) -> PyResult<DriverConnectOption> {
     // Values validated by the Python-level connect() wrapper, like mod_connect.
     match value {
@@ -649,6 +778,7 @@ fn driver_completion_from_int(value: i32) -> PyResult<DriverConnectOption> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_connect(
     state: &mut ConnState,
     henv: usize,
@@ -657,6 +787,7 @@ fn do_connect(
     autocommit: bool,
     readonly: bool,
     completion: DriverConnectOption,
+    preconn: Vec<PreconnAttr>,
 ) -> PyResult<()> {
     let mut hdbc: Handle = std::ptr::null_mut();
     let ret = unsafe { odbc_sys::SQLAllocHandle(HandleType::Dbc, henv as Handle, &mut hdbc) };
@@ -675,6 +806,20 @@ fn do_connect(
         }
         err
     };
+
+    // Attributes that must be set before connecting (attrs_before).
+    for attr in &preconn {
+        let (value, length): (Pointer, i32) = match &attr.value {
+            PreconnValue::UInt(v) => (*v as Pointer, odbc_sys::IS_UINTEGER),
+            PreconnValue::Int(v) => (*v as Pointer, odbc_sys::IS_INTEGER),
+            PreconnValue::Bytes(b) => (b.as_ptr() as Pointer, odbc_sys::IS_POINTER),
+            PreconnValue::Str(b) => (b.as_ptr() as Pointer, odbc_sys::NTS as i32),
+        };
+        let ret = unsafe { RawSQLSetConnectAttrW(hdbc as HDbc, attr.key, value, length) };
+        if !succeeded(ret) {
+            return Err(fail("SQLSetConnectAttr", hdbc));
+        }
+    }
 
     if timeout > 0 {
         let ret = unsafe {
@@ -746,6 +891,16 @@ fn do_connect(
 
     state.cnxninfo = probe_cnxninfo(hdbc);
 
+    // Keep the attrs_before buffers alive for the connection's lifetime: some
+    // drivers hold on to the pointers well past SQLDriverConnect (issue #1469).
+    state.preconn_keepalive = preconn
+        .into_iter()
+        .filter_map(|a| match a.value {
+            PreconnValue::Bytes(b) | PreconnValue::Str(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+
     state.hdbc = hdbc as usize;
     state.hdbc_public.store(hdbc as usize, Ordering::Relaxed);
     Ok(())
@@ -771,7 +926,8 @@ fn encode_connection_string(connstring: &str, encoding: Option<&str>) -> PyResul
 /// pyodbc.connect() wrapper builds the connection string and keyword handling on
 /// top of this.
 #[pyfunction]
-#[pyo3(signature = (connstring, *, autocommit=false, readonly=false, timeout=0, encoding=None, driver_completion=0))]
+#[pyo3(signature = (connstring, *, autocommit=false, readonly=false, timeout=0, encoding=None, driver_completion=0, attrs_before=None))]
+#[allow(clippy::too_many_arguments)]
 pub fn connect(
     py: Python<'_>,
     connstring: &str,
@@ -780,10 +936,15 @@ pub fn connect(
     timeout: u32,
     encoding: Option<&str>,
     driver_completion: i32,
+    attrs_before: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let henv = env::get_env(py)? as usize;
     let completion = driver_completion_from_int(driver_completion)?;
     let wcs = encode_connection_string(connstring, encoding)?;
+    let preconn = match attrs_before {
+        Some(d) => extract_preconn_attrs(py, d, encoding.unwrap_or("utf-16le"))?,
+        None => Vec::new(),
+    };
 
     let autocommit_flag = Arc::new(AtomicBool::new(autocommit));
     let hdbc_public = Arc::new(AtomicUsize::new(0));
@@ -803,13 +964,16 @@ pub fn connect(
             hdbc_public,
             encodings: Arc::new(Mutex::new(ConnEncodings::default())),
             converters: Arc::new(Mutex::new(HashMap::new())),
+            searchescape_cache: Arc::new(Mutex::new(None)),
         },
     )?;
     let conn_result: Py<PyAny> = conn.clone_ref(py).into_any();
 
     let (fut, handle) = async_bridge::new_future(py)?;
     let task: Task = Box::new(move |state| {
-        let result = do_connect(state, henv, wcs, timeout, autocommit, readonly, completion);
+        let result = do_connect(
+            state, henv, wcs, timeout, autocommit, readonly, completion, preconn,
+        );
         let ok = result.is_ok();
         Python::attach(|py| {
             handle.complete(py, result.map(|_| conn_result));
