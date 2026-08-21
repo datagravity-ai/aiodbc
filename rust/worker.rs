@@ -16,6 +16,36 @@ use pyo3::prelude::*;
 use crate::async_bridge::new_future;
 use crate::errors::ProgrammingError;
 
+/// Driver capabilities probed at connect time (ported from CnxnInfo in
+/// cnxninfo.cpp; the per-connection-string cache is not carried over - probing a
+/// handful of attributes per connect is cheap and always current).
+#[derive(Clone)]
+pub struct CnxnInfo {
+    pub supports_describeparam: bool,
+    /// COLUMN_SIZE of SQL_TYPE_TIMESTAMP, e.g. 23 for SQL Server datetime.
+    pub datetime_precision: i32,
+    pub varchar_maxlength: usize,
+    pub wvarchar_maxlength: usize,
+    pub binary_maxlength: usize,
+    /// SQLGetInfo(SQL_NEED_LONG_DATA_LEN): whether data-at-execution parameters
+    /// must declare their length up front.
+    pub need_long_data_len: bool,
+}
+
+impl Default for CnxnInfo {
+    fn default() -> Self {
+        // The defaults from CnxnInfo_New for drivers that can't be probed.
+        CnxnInfo {
+            supports_describeparam: false,
+            datetime_precision: 19, // "yyyy-mm-dd hh:mm:ss"
+            varchar_maxlength: 1 << 30,
+            wvarchar_maxlength: 1 << 30,
+            binary_maxlength: 1 << 30,
+            need_long_data_len: false,
+        }
+    }
+}
+
 /// Connection state owned by (and only touched from) the worker thread, except for
 /// the shared autocommit flag which the Connection reads for its sync property.
 pub struct ConnState {
@@ -23,9 +53,8 @@ pub struct ConnState {
     pub autocommit: Arc<AtomicBool>,
     /// Mirror of hdbc readable from the Connection object (for the hdbc property).
     pub hdbc_public: Arc<AtomicUsize>,
-    /// SQLGetInfo(SQL_NEED_LONG_DATA_LEN), probed at connect; drives how
-    /// data-at-execution parameters declare their length.
-    pub need_long_data_len: bool,
+    /// Driver capabilities probed at connect.
+    pub cnxninfo: CnxnInfo,
 }
 
 impl ConnState {
@@ -70,7 +99,7 @@ pub fn spawn(autocommit: Arc<AtomicBool>, hdbc_public: Arc<AtomicUsize>) -> PyRe
                 hdbc: 0,
                 autocommit,
                 hdbc_public,
-                need_long_data_len: false,
+                cnxninfo: CnxnInfo::default(),
             };
             while let Ok(task) = rx.recv() {
                 if !task(&mut state) {

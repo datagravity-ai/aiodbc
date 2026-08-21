@@ -12,6 +12,15 @@ jobs:
     name: Build and smoke-test the Rust core
     runs-on: ubuntu-24.04
 
+    services:
+      mssql2019:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        ports:
+        - 1402:1433
+        env:
+          ACCEPT_EULA: Y
+          SA_PASSWORD: StrongPassword2019
+
     steps:
     - uses: actions/checkout@v4.3.0
 
@@ -29,6 +38,15 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y unixodbc-dev libsqliteodbc
+
+    - name: Install the ODBC driver for SQL Server
+      run: |
+        sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
+
+    - name: Create the test database in SQL Server
+      run: |
+        docker exec -i "${{ job.services.mssql2019.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2019' -C -Q "SELECT @@VERSION" || sleep 5
+        docker exec -i "${{ job.services.mssql2019.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2019' -C -Q "CREATE DATABASE test"
 
     - name: Lint
       run: |
@@ -118,6 +136,12 @@ jobs:
       run: |
         pip install -r requirements-dev.txt
         python -m pytest tests/sqlite_test.py --no-header -q
+
+    - name: Run the SQL Server test suite
+      env:
+        PYODBC_SQLSERVER: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1402;UID=sa;PWD=StrongPassword2019;DATABASE=test;Encrypt=Optional"
+      run: |
+        python -m pytest tests/sqlserver_test.py --no-header -q
 
     - name: Check generated constants are up to date
       run: |

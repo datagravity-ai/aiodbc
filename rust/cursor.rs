@@ -43,6 +43,7 @@ pub struct ColInfo {
     pub sql_type: i16,
     pub column_size: u64,
     pub use_decimal_binary: bool,
+    pub is_unsigned: bool,
 }
 
 /// Raw column description read via SQLDescribeColW, converted into the Python
@@ -54,6 +55,7 @@ struct RawCol {
     decimal_digits: i16,
     nullable: Nullability,
     use_decimal_binary: bool,
+    is_unsigned: bool,
 }
 
 /// One diagnostic record for Cursor.messages.
@@ -91,6 +93,11 @@ pub struct Cursor {
     /// If True, rows are returned as dicts keyed by column name.
     #[pyo3(get, set)]
     rows_as_dicts: bool,
+    /// If True, executemany binds all rows as parameter arrays in one execute.
+    #[pyo3(get, set)]
+    fast_executemany: bool,
+    /// Overrides from setinputsizes, one entry per parameter position.
+    inputsizes: Vec<Option<params::InputSize>>,
 }
 
 enum ExecuteRows {
@@ -115,6 +122,8 @@ struct ExecCtx {
     metadata_enc: TextEnc,
     fetch_decimal_as_string: bool,
     byte_len_diag: bool,
+    inputsizes: Vec<Option<params::InputSize>>,
+    fast_executemany: bool,
 }
 
 /// Ported from IsSequence in cursor.cpp: only list, tuple, and Row count as a
@@ -147,6 +156,8 @@ impl Cursor {
             closed: false,
             arraysize: 1,
             rows_as_dicts: false,
+            fast_executemany: false,
+            inputsizes: Vec::new(),
         }
     }
 
@@ -225,6 +236,8 @@ impl Cursor {
                     metadata_enc: encs.metadata,
                     fetch_decimal_as_string: conn.fetch_decimal_as_string_value(),
                     byte_len_diag: conn.diagrec_byte_length(),
+                    inputsizes: this.inputsizes.clone(),
+                    fast_executemany: this.fast_executemany,
                 },
                 conn.converter_types(),
             )
@@ -240,8 +253,8 @@ impl Cursor {
             let hstmt = ensure_hstmt(state, &shared)?;
             free_results(hstmt);
 
-            let need_long = state.need_long_data_len;
-            let (rowcount, raw_cols, diags) = execute_odbc(hstmt, &ctx, rows, need_long)?;
+            let cnxninfo = state.cnxninfo.clone();
+            let (rowcount, raw_cols, diags) = execute_odbc(hstmt, &ctx, rows, cnxninfo)?;
 
             {
                 let mut guard = shared.lock().unwrap();
@@ -251,6 +264,7 @@ impl Cursor {
                         sql_type: c.sql_type,
                         column_size: c.column_size,
                         use_decimal_binary: c.use_decimal_binary,
+                        is_unsigned: c.is_unsigned,
                     })
                     .collect();
                 guard.rowcount = rowcount;
@@ -472,6 +486,16 @@ impl Cursor {
         sql: &str,
         param_rows: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        // Ported from Cursor_executemany: only sequences, iterators, and
+        // generators are accepted as the parameter collection.
+        let acceptable = is_param_sequence(param_rows)
+            || param_rows.hasattr("__next__")?
+            || param_rows.hasattr("gi_frame")?;
+        if !acceptable {
+            return Err(ProgrammingError::new_err(
+                "The second parameter to executemany must be a sequence, iterator, or generator.",
+            ));
+        }
         let unicode_enc = slf
             .borrow()
             .connection
@@ -518,6 +542,315 @@ impl Cursor {
         self.fetch_future(py, FetchMode::Skip(count))
     }
 
+    /// Declare parameter types/sizes ahead of an execute; None clears them.
+    /// Entries may be an int (column size) or a tuple (sqltype, size, scale).
+    #[pyo3(signature = (sizes, /))]
+    fn setinputsizes(&mut self, sizes: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let Some(sizes) = sizes else {
+            self.inputsizes.clear();
+            return Ok(());
+        };
+        let iterable = sizes.is_instance_of::<PyList>()
+            || sizes.is_instance_of::<PyTuple>()
+            || sizes.hasattr("__next__")?
+            || sizes.hasattr("gi_frame")?;
+        if !iterable {
+            return Err(ProgrammingError::new_err(
+                "A non-None parameter to setinputsizes must be a sequence, iterator, or generator.",
+            ));
+        }
+        let mut out = Vec::new();
+        for entry in sizes.try_iter()? {
+            let entry = entry?;
+            if entry.is_none() {
+                out.push(None);
+            } else if let Ok(size) = entry.extract::<u64>() {
+                out.push(Some(params::InputSize {
+                    column_size: Some(size),
+                    ..Default::default()
+                }));
+            } else {
+                // (sqltype, size, scale) with trailing entries optional.
+                let tup = entry;
+                let mut over = params::InputSize::default();
+                if let Ok(t) = tup.get_item(0) {
+                    if !t.is_none() {
+                        over.sqltype = Some(t.extract::<i32>()? as i16);
+                    }
+                }
+                if let Ok(s) = tup.get_item(1) {
+                    if !s.is_none() {
+                        over.column_size = Some(s.extract()?);
+                    }
+                }
+                if let Ok(sc) = tup.get_item(2) {
+                    if !sc.is_none() {
+                        over.scale = Some(sc.extract()?);
+                    }
+                }
+                out.push(Some(over));
+            }
+        }
+        self.inputsizes = out;
+        Ok(())
+    }
+
+    /// Whether the driver scans SQL for escape sequences (SQL_ATTR_NOSCAN,
+    /// inverted).  Reads/writes the live statement attribute like cursor.cpp.
+    #[getter]
+    fn noscan(&self, py: Python<'_>) -> PyResult<bool> {
+        self.validate(py)?;
+        let shared = self.shared.clone();
+        crate::worker::dispatch_sync(py, &self.tx, move |_state| {
+            let hstmt = shared.lock().unwrap().hstmt;
+            if hstmt == 0 {
+                return Ok(false); // no statement yet: the default is off
+            }
+            let mut value: usize = 0;
+            let ret = unsafe {
+                odbc_sys::SQLGetStmtAttr(
+                    hstmt as HStmt,
+                    StatementAttribute::NoScan,
+                    &mut value as *mut usize as Pointer,
+                    std::mem::size_of::<usize>() as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            // Not supported?  Assume 'no', like Cursor_getnoscan.
+            Ok(succeeded(ret) && value != 0)
+        })
+    }
+
+    #[setter]
+    fn set_noscan(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        self.validate(py)?;
+        let shared = self.shared.clone();
+        crate::worker::dispatch_sync(py, &self.tx, move |state| {
+            let hstmt = ensure_hstmt(state, &shared)?;
+            let ret = unsafe {
+                odbc_sys::SQLSetStmtAttr(
+                    hstmt,
+                    StatementAttribute::NoScan,
+                    usize::from(value) as Pointer,
+                    0,
+                )
+            };
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    "SQLSetStmtAttr(SQL_ATTR_NOSCAN)",
+                    HandleType::Stmt,
+                    hstmt as Handle,
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    // -- catalog functions ---------------------------------------------------
+
+    #[pyo3(signature = (table=None, catalog=None, schema=None, tableType=None))]
+    #[allow(non_snake_case)]
+    fn tables(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        tableType: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::Tables(optw(catalog), optw(schema), optw(table), optw(tableType)),
+        )
+    }
+
+    #[pyo3(name = "tablePrivileges", signature = (table=None, catalog=None, schema=None))]
+    fn table_privileges(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::TablePrivileges(optw(catalog), optw(schema), optw(table)),
+        )
+    }
+
+    #[pyo3(signature = (table=None, catalog=None, schema=None, column=None))]
+    fn columns(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        column: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::Columns(optw(catalog), optw(schema), optw(table), optw(column)),
+        )
+    }
+
+    #[pyo3(signature = (table, catalog=None, schema=None, unique=false, quick=true))]
+    fn statistics(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: &str,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        unique: bool,
+        quick: bool,
+    ) -> PyResult<Py<PyAny>> {
+        // SQL_INDEX_UNIQUE=0 / SQL_INDEX_ALL=1; SQL_QUICK=0 / SQL_ENSURE=1
+        let unique_flag = if unique { 0 } else { 1 };
+        let quick_flag = if quick { 0 } else { 1 };
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::Statistics(
+                optw(catalog),
+                optw(schema),
+                optw(Some(table)),
+                unique_flag,
+                quick_flag,
+            ),
+        )
+    }
+
+    #[pyo3(name = "rowIdColumns", signature = (table, catalog=None, schema=None, nullable=true))]
+    fn row_id_columns(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: &str,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        nullable: bool,
+    ) -> PyResult<Py<PyAny>> {
+        // SQL_BEST_ROWID = 1
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::SpecialColumns(
+                1,
+                optw(catalog),
+                optw(schema),
+                optw(Some(table)),
+                u16::from(nullable),
+            ),
+        )
+    }
+
+    #[pyo3(name = "rowVerColumns", signature = (table, catalog=None, schema=None, nullable=true))]
+    fn row_ver_columns(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: &str,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        nullable: bool,
+    ) -> PyResult<Py<PyAny>> {
+        // SQL_ROWVER = 2
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::SpecialColumns(
+                2,
+                optw(catalog),
+                optw(schema),
+                optw(Some(table)),
+                u16::from(nullable),
+            ),
+        )
+    }
+
+    #[pyo3(name = "primaryKeys", signature = (table, catalog=None, schema=None))]
+    fn primary_keys(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: &str,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::PrimaryKeys(optw(catalog), optw(schema), optw(Some(table))),
+        )
+    }
+
+    #[pyo3(name = "foreignKeys", signature = (table=None, catalog=None, schema=None, foreignTable=None, foreignCatalog=None, foreignSchema=None))]
+    #[allow(non_snake_case)]
+    #[allow(clippy::too_many_arguments)]
+    fn foreign_keys(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        table: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        foreignTable: Option<&str>,
+        foreignCatalog: Option<&str>,
+        foreignSchema: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::ForeignKeys(
+                optw(catalog),
+                optw(schema),
+                optw(table),
+                optw(foreignCatalog),
+                optw(foreignSchema),
+                optw(foreignTable),
+            ),
+        )
+    }
+
+    #[pyo3(signature = (procedure=None, catalog=None, schema=None))]
+    fn procedures(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        procedure: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::Procedures(optw(catalog), optw(schema), optw(procedure)),
+        )
+    }
+
+    #[pyo3(name = "procedureColumns", signature = (procedure=None, catalog=None, schema=None))]
+    fn procedure_columns(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        procedure: Option<&str>,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        Self::run_catalog(
+            slf,
+            py,
+            CatalogCall::ProcedureColumns(optw(catalog), optw(schema), optw(procedure), None),
+        )
+    }
+
+    #[pyo3(name = "getTypeInfo", signature = (sqlType=None, /))]
+    #[allow(non_snake_case)]
+    fn get_type_info(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        sqlType: Option<i32>,
+    ) -> PyResult<Py<PyAny>> {
+        // SQL_ALL_TYPES = 0
+        Self::run_catalog(slf, py, CatalogCall::TypeInfo(sqlType.unwrap_or(0) as i16))
+    }
+
     /// Switch to the next result set.  Resolves to True if one exists.
     fn nextset(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let this = slf.borrow();
@@ -545,7 +878,15 @@ impl Cursor {
             };
             let ret = unsafe { odbc_sys::SQLMoreResults(hstmt) };
             if ret == SqlReturn::NO_DATA {
+                // Like Cursor_nextset: free_results clears the result state and
+                // resets messages before returning False.
+                shared.lock().unwrap().colinfos.clear();
                 return Ok(Box::new(move |py: Python<'_>| {
+                    let mut guard = shared.lock().unwrap();
+                    guard.description = None;
+                    guard.name_map = None;
+                    guard.messages = Some(PyList::empty(py).into_any().unbind());
+                    drop(guard);
                     Ok(false.into_pyobject(py)?.to_owned().into_any().unbind())
                 }) as Finisher);
             }
@@ -571,6 +912,7 @@ impl Cursor {
                         sql_type: c.sql_type,
                         column_size: c.column_size,
                         use_decimal_binary: c.use_decimal_binary,
+                        is_unsigned: c.is_unsigned,
                     })
                     .collect();
             }
@@ -672,6 +1014,271 @@ impl Cursor {
         } else {
             Ok(async_bridge::resolved_future(py, py.None().into_bound(py))?.unbind())
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog functions (SQLTables, SQLColumns, ...)
+// ---------------------------------------------------------------------------
+
+// W catalog entry points missing from odbc-sys.
+extern "system" {
+    fn SQLStatisticsW(
+        hstmt: HStmt,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        table: *const u16,
+        table_len: i16,
+        unique: u16,
+        reserved: u16,
+    ) -> SqlReturn;
+    fn SQLPrimaryKeysW(
+        hstmt: HStmt,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        table: *const u16,
+        table_len: i16,
+    ) -> SqlReturn;
+    fn SQLProceduresW(
+        hstmt: HStmt,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        proc_name: *const u16,
+        proc_len: i16,
+    ) -> SqlReturn;
+    fn SQLProcedureColumnsW(
+        hstmt: HStmt,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        proc_name: *const u16,
+        proc_len: i16,
+        column: *const u16,
+        column_len: i16,
+    ) -> SqlReturn;
+    fn SQLTablePrivilegesW(
+        hstmt: HStmt,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        table: *const u16,
+        table_len: i16,
+    ) -> SqlReturn;
+    fn SQLSpecialColumnsW(
+        hstmt: HStmt,
+        identifier_type: u16,
+        catalog: *const u16,
+        catalog_len: i16,
+        schema: *const u16,
+        schema_len: i16,
+        table: *const u16,
+        table_len: i16,
+        scope: u16,
+        nullable: u16,
+    ) -> SqlReturn;
+}
+
+type OptW = Option<Vec<u16>>;
+
+fn optw(s: Option<&str>) -> OptW {
+    s.map(|s| s.encode_utf16().collect())
+}
+
+fn wptr(s: &OptW) -> (*const u16, i16) {
+    match s {
+        Some(v) => (v.as_ptr(), v.len() as i16),
+        None => (std::ptr::null(), 0),
+    }
+}
+
+/// One catalog call, with pre-encoded (UTF-16) string arguments.
+enum CatalogCall {
+    Tables(OptW, OptW, OptW, OptW),         // catalog, schema, table, type
+    Columns(OptW, OptW, OptW, OptW),        // catalog, schema, table, column
+    Statistics(OptW, OptW, OptW, u16, u16), // ..., unique, quick
+    PrimaryKeys(OptW, OptW, OptW),
+    ForeignKeys(OptW, OptW, OptW, OptW, OptW, OptW), // pk cat/schema/table, fk ...
+    Procedures(OptW, OptW, OptW),
+    ProcedureColumns(OptW, OptW, OptW, OptW),
+    TablePrivileges(OptW, OptW, OptW),
+    SpecialColumns(u16, OptW, OptW, OptW, u16), // id_type, ..., nullable
+    TypeInfo(i16),
+}
+
+impl CatalogCall {
+    fn function_name(&self) -> &'static str {
+        match self {
+            CatalogCall::Tables(..) => "SQLTables",
+            CatalogCall::Columns(..) => "SQLColumns",
+            CatalogCall::Statistics(..) => "SQLStatistics",
+            CatalogCall::PrimaryKeys(..) => "SQLPrimaryKeys",
+            CatalogCall::ForeignKeys(..) => "SQLForeignKeys",
+            CatalogCall::Procedures(..) => "SQLProcedures",
+            CatalogCall::ProcedureColumns(..) => "SQLProcedureColumns",
+            CatalogCall::TablePrivileges(..) => "SQLTablePrivileges",
+            CatalogCall::SpecialColumns(..) => "SQLSpecialColumns",
+            CatalogCall::TypeInfo(..) => "SQLGetTypeInfo",
+        }
+    }
+
+    fn run(&self, hstmt: HStmt) -> SqlReturn {
+        unsafe {
+            match self {
+                CatalogCall::Tables(cat, sch, tbl, ty) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    let (y, yl) = wptr(ty);
+                    odbc_sys::SQLTablesW(hstmt, c, cl, s, sl, t, tl, y, yl)
+                }
+                CatalogCall::Columns(cat, sch, tbl, col) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    let (o, ol) = wptr(col);
+                    odbc_sys::SQLColumnsW(hstmt, c, cl, s, sl, t, tl, o, ol)
+                }
+                CatalogCall::Statistics(cat, sch, tbl, unique, quick) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    SQLStatisticsW(hstmt, c, cl, s, sl, t, tl, *unique, *quick)
+                }
+                CatalogCall::PrimaryKeys(cat, sch, tbl) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    SQLPrimaryKeysW(hstmt, c, cl, s, sl, t, tl)
+                }
+                CatalogCall::ForeignKeys(pc, ps, pt, fc, fs, ft) => {
+                    let (a, al) = wptr(pc);
+                    let (b, bl) = wptr(ps);
+                    let (c, cl) = wptr(pt);
+                    let (d, dl) = wptr(fc);
+                    let (e, el) = wptr(fs);
+                    let (f, fl) = wptr(ft);
+                    odbc_sys::SQLForeignKeysW(hstmt, a, al, b, bl, c, cl, d, dl, e, el, f, fl)
+                }
+                CatalogCall::Procedures(cat, sch, proc) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (p, pl) = wptr(proc);
+                    SQLProceduresW(hstmt, c, cl, s, sl, p, pl)
+                }
+                CatalogCall::ProcedureColumns(cat, sch, proc, col) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (p, pl) = wptr(proc);
+                    let (o, ol) = wptr(col);
+                    SQLProcedureColumnsW(hstmt, c, cl, s, sl, p, pl, o, ol)
+                }
+                CatalogCall::TablePrivileges(cat, sch, tbl) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    SQLTablePrivilegesW(hstmt, c, cl, s, sl, t, tl)
+                }
+                CatalogCall::SpecialColumns(id_type, cat, sch, tbl, nullable) => {
+                    let (c, cl) = wptr(cat);
+                    let (s, sl) = wptr(sch);
+                    let (t, tl) = wptr(tbl);
+                    // scope: SQL_SCOPE_CURROW (0)
+                    SQLSpecialColumnsW(hstmt, *id_type, c, cl, s, sl, t, tl, 0, *nullable)
+                }
+                CatalogCall::TypeInfo(sqltype) => {
+                    odbc_sys::SQLGetTypeInfo(hstmt, SqlDataType(*sqltype))
+                }
+            }
+        }
+    }
+}
+
+impl Cursor {
+    /// Run a catalog function and expose its result set on this cursor, like an
+    /// execute.  Resolves to the cursor.
+    fn run_catalog(
+        slf: &Bound<'_, Cursor>,
+        py: Python<'_>,
+        call: CatalogCall,
+    ) -> PyResult<Py<PyAny>> {
+        let this = slf.borrow();
+        this.validate(py)?;
+
+        let native_uuid = module_flag(py, "native_uuid");
+        let (metadata_enc, fetch_dec_str, converter_types) = {
+            let conn = this.connection.bind(py).borrow();
+            (
+                conn.encodings_snapshot().metadata,
+                conn.fetch_decimal_as_string_value(),
+                conn.converter_types(),
+            )
+        };
+
+        let shared = this.shared.clone();
+        let cursor_obj: Py<PyAny> = slf.clone().into_any().unbind();
+
+        dispatch_future(py, &this.tx, move |state| {
+            if state.hdbc == 0 {
+                return Err(crate::worker::closed_connection_err());
+            }
+            let hstmt = ensure_hstmt(state, &shared)?;
+            free_results(hstmt);
+
+            let ret = call.run(hstmt);
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    call.function_name(),
+                    HandleType::Stmt,
+                    hstmt as Handle,
+                ));
+            }
+
+            let mut rowcount: Len = 0;
+            let ret = unsafe { odbc_sys::SQLRowCount(hstmt, &mut rowcount) };
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    "SQLRowCount",
+                    HandleType::Stmt,
+                    hstmt as Handle,
+                ));
+            }
+
+            let raw_cols = describe_columns(hstmt, &metadata_enc, fetch_dec_str)?;
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.colinfos = raw_cols
+                    .iter()
+                    .map(|c| ColInfo {
+                        sql_type: c.sql_type,
+                        column_size: c.column_size,
+                        use_decimal_binary: c.use_decimal_binary,
+                        is_unsigned: c.is_unsigned,
+                    })
+                    .collect();
+                guard.rowcount = rowcount as i64;
+            }
+
+            Ok(Box::new(move |py: Python<'_>| {
+                // Catalog result columns are ALWAYS lowercased, regardless of
+                // pyodbc.lowercase (create_name_map(cur, cCols, true) in cursor.cpp).
+                let (description, name_map) =
+                    build_description(py, &raw_cols, true, native_uuid, &converter_types)?;
+                let mut guard = shared.lock().unwrap();
+                guard.description = description;
+                guard.name_map = name_map;
+                guard.messages = Some(PyList::empty(py).into_any().unbind());
+                drop(guard);
+                Ok(cursor_obj)
+            }) as Finisher)
+        })
     }
 }
 
@@ -913,6 +1520,25 @@ fn describe_columns(
             }
         }
 
+        // SQL_DESC_UNSIGNED drives whether integer columns fetch as unsigned
+        // (MySQL unsigned BIGINT, for example).
+        let mut is_unsigned = false;
+        if matches!(data_type.0, 4 | 5 | -5 | -6) {
+            let mut unsigned_attr: Len = 0;
+            let ret = unsafe {
+                odbc_sys::SQLColAttributeW(
+                    hstmt,
+                    i + 1,
+                    Desc::Unsigned,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut unsigned_attr,
+                )
+            };
+            is_unsigned = succeeded(ret) && unsigned_attr != 0; // SQL_TRUE
+        }
+
         cols.push(RawCol {
             name,
             sql_type: data_type.0,
@@ -920,6 +1546,7 @@ fn describe_columns(
             decimal_digits,
             nullable,
             use_decimal_binary,
+            is_unsigned,
         });
     }
     Ok(cols)
@@ -982,14 +1609,25 @@ fn execute_odbc(
     hstmt: HStmt,
     ctx: &ExecCtx,
     rows: ExecuteRows,
-    need_long_data_len: bool,
+    cnxninfo: crate::worker::CnxnInfo,
 ) -> PyResult<(i64, Vec<RawCol>, Vec<RawDiag>)> {
+    let limits = params::ParamLimits {
+        maxwrite: ctx.maxwrite,
+        cnxninfo,
+    };
+    let override_for = |i: usize| ctx.inputsizes.get(i).and_then(|o| o.as_ref());
     let on_err = |func: &'static str| {
         error_from_handle_ex(func, HandleType::Stmt, hstmt as Handle, ctx.byte_len_diag)
     };
 
-    let exec_prepared = |bound: &[BoundParam]| -> PyResult<SqlReturn> {
+    let exec_prepared = |bound: &[BoundParam], diags: &mut Vec<RawDiag>| -> PyResult<SqlReturn> {
         let mut ret = unsafe { odbc_sys::SQLExecute(hstmt) };
+
+        // Diagnostics (e.g. PRINT output) must be read before any further ODBC
+        // call on the handle resets them (cursor.cpp collects before the DAE loop).
+        if ret == SqlReturn::SUCCESS_WITH_INFO {
+            diags.extend(collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag));
+        }
 
         // One or more parameters were bound as data-at-execution: stream them via
         // SQLParamData/SQLPutData (cursor.cpp execute).
@@ -997,37 +1635,64 @@ fn execute_odbc(
             let mut token: Pointer = std::ptr::null_mut();
             ret = unsafe { odbc_sys::SQLParamData(hstmt, &mut token) };
             if ret == SqlReturn::NEED_DATA {
-                let index = (token as usize).wrapping_sub(1);
-                let data = bound
-                    .get(index)
-                    .filter(|b| b.is_dae())
-                    .map(|b| b.dae_bytes())
-                    .ok_or_else(|| {
-                        ProgrammingError::new_err("driver requested data for an unknown parameter")
-                    })?;
-                let chunk = if ctx.maxwrite > 0 {
-                    ctx.maxwrite
-                } else {
-                    data.len().max(1)
-                };
-                let mut offset = 0usize;
-                loop {
-                    let remaining = chunk.min(data.len() - offset);
-                    let put = unsafe {
-                        odbc_sys::SQLPutData(
-                            hstmt,
-                            data[offset..].as_ptr() as Pointer,
-                            remaining as Len,
-                        )
-                    };
+                let t = token as usize;
+                if let Some(tvp) = bound
+                    .iter()
+                    .find(|p| p.tvp().is_some() && p.tvp_token() == t)
+                    .and_then(|p| p.tvp())
+                {
+                    // The driver wants the next TVP row (or end-of-rows).
+                    let put = tvp.advance_row(hstmt);
                     if !succeeded(put) {
                         return Err(on_err("SQLPutData"));
                     }
-                    offset += remaining;
-                    if offset >= data.len() {
-                        break;
+                } else if t >= 1 && t <= bound.len() && bound[t - 1].is_dae() {
+                    let param = &bound[t - 1];
+                    {
+                        // Stream a long value in chunks.
+                        let data = param.dae_bytes();
+                        let chunk = param.dae_chunk();
+                        let mut offset = 0usize;
+                        loop {
+                            let remaining = chunk.min(data.len() - offset);
+                            let put = unsafe {
+                                odbc_sys::SQLPutData(
+                                    hstmt,
+                                    data[offset..].as_ptr() as Pointer,
+                                    remaining as Len,
+                                )
+                            };
+                            if !succeeded(put) {
+                                return Err(on_err("SQLPutData"));
+                            }
+                            offset += remaining;
+                            if offset >= data.len() {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // A TVP column token: find which TVP owns it.
+                    let mut handled = false;
+                    for param in bound {
+                        if let Some(tvp) = param.tvp() {
+                            if let Some(col) = tvp.find_column(t) {
+                                tvp.put_column(hstmt, col, &on_err)?;
+                                handled = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !handled {
+                        return Err(ProgrammingError::new_err(
+                            "driver requested data for an unknown parameter",
+                        ));
                     }
                 }
+            } else if ret == SqlReturn::SUCCESS_WITH_INFO {
+                // The final SQLParamData carries diagnostics for the whole
+                // statement (e.g. PRINT output; issue #1140).
+                diags.extend(collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag));
             } else if ret != SqlReturn::NO_DATA && !succeeded(ret) {
                 return Err(on_err("SQLParamData"));
             }
@@ -1035,6 +1700,7 @@ fn execute_odbc(
         Ok(ret)
     };
 
+    let mut diags: Vec<RawDiag> = Vec::new();
     let mut with_info = false;
     match rows {
         ExecuteRows::One(values) if values.is_empty() => {
@@ -1059,21 +1725,26 @@ fn execute_odbc(
                 return Err(on_err("SQLExecDirectW"));
             }
             with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
+            if with_info {
+                diags.extend(collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag));
+            }
         }
         ExecuteRows::One(values) => {
             prepare(hstmt, ctx, &on_err)?;
+            let described = describe_null_params(hstmt, std::slice::from_ref(&values), &limits);
             let mut bound: Vec<BoundParam> = Vec::with_capacity(values.len());
             for (i, value) in values.into_iter().enumerate() {
                 bound.push(params::bind(
                     hstmt,
                     i,
                     value,
-                    ctx.maxwrite,
-                    need_long_data_len,
+                    &limits,
+                    override_for(i),
+                    described.get(i).copied().flatten(),
                     on_err,
                 )?);
             }
-            let ret = exec_prepared(&bound)?;
+            let ret = exec_prepared(&bound, &mut diags)?;
             if !succeeded(ret) && ret != SqlReturn::NO_DATA {
                 return Err(on_err("SQLExecute"));
             }
@@ -1082,36 +1753,60 @@ fn execute_odbc(
         }
         ExecuteRows::Many(param_rows) => {
             prepare(hstmt, ctx, &on_err)?;
-            for values in param_rows {
-                unsafe {
-                    let _ = odbc_sys::SQLFreeStmt(hstmt, FreeStmtOption::ResetParams);
+
+            // fast_executemany: bind every row as column-wise parameter arrays and
+            // execute once.  Falls back to the per-row loop when the data doesn't
+            // fit the fast path.
+            let mut fast_done = false;
+            if ctx.fast_executemany && !param_rows.is_empty() {
+                if let Some(columns) =
+                    params::bind_parameter_arrays(hstmt, &param_rows, &limits, on_err)?
+                {
+                    let ret = unsafe { odbc_sys::SQLExecute(hstmt) };
+                    with_info = ret == SqlReturn::SUCCESS_WITH_INFO;
+                    if with_info {
+                        // Read before reset_paramset_size clears the diagnostics.
+                        diags.extend(collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag));
+                    }
+                    params::reset_paramset_size(hstmt);
+                    if !succeeded(ret) && ret != SqlReturn::NO_DATA {
+                        return Err(on_err("SQLExecute"));
+                    }
+                    drop(columns); // arrays must outlive SQLExecute
+                    fast_done = true;
                 }
-                let mut bound: Vec<BoundParam> = Vec::with_capacity(values.len());
-                for (i, value) in values.into_iter().enumerate() {
-                    bound.push(params::bind(
-                        hstmt,
-                        i,
-                        value,
-                        ctx.maxwrite,
-                        need_long_data_len,
-                        on_err,
-                    )?);
+            }
+
+            if !fast_done {
+                let described = describe_null_params(hstmt, &param_rows, &limits);
+                for values in param_rows {
+                    unsafe {
+                        let _ = odbc_sys::SQLFreeStmt(hstmt, FreeStmtOption::ResetParams);
+                    }
+                    let mut bound: Vec<BoundParam> = Vec::with_capacity(values.len());
+                    for (i, value) in values.into_iter().enumerate() {
+                        bound.push(params::bind(
+                            hstmt,
+                            i,
+                            value,
+                            &limits,
+                            override_for(i),
+                            described.get(i).copied().flatten(),
+                            on_err,
+                        )?);
+                    }
+                    let ret = exec_prepared(&bound, &mut diags)?;
+                    if !succeeded(ret) && ret != SqlReturn::NO_DATA {
+                        return Err(on_err("SQLExecute"));
+                    }
+                    with_info = with_info || ret == SqlReturn::SUCCESS_WITH_INFO;
+                    drop(bound);
                 }
-                let ret = exec_prepared(&bound)?;
-                if !succeeded(ret) && ret != SqlReturn::NO_DATA {
-                    return Err(on_err("SQLExecute"));
-                }
-                with_info = with_info || ret == SqlReturn::SUCCESS_WITH_INFO;
-                drop(bound);
             }
         }
     }
 
-    let diags = if with_info {
-        collect_diag(hstmt, &ctx.metadata_enc, ctx.byte_len_diag)
-    } else {
-        Vec::new()
-    };
+    let _ = with_info;
 
     let mut rowcount: Len = 0;
     let ret = unsafe { odbc_sys::SQLRowCount(hstmt, &mut rowcount) };
@@ -1121,6 +1816,30 @@ fn execute_odbc(
 
     let cols = describe_columns(hstmt, &ctx.metadata_enc, ctx.fetch_decimal_as_string)?;
     Ok((rowcount as i64, cols, diags))
+}
+
+/// Describe (via SQLDescribeParam) every parameter position that is NULL in any
+/// row.  Must run right after SQLPrepare, before any SQLBindParameter: some drivers
+/// misreport parameter types once binding has started (see test_none_param).
+fn describe_null_params(
+    hstmt: HStmt,
+    rows: &[Vec<ParamValue>],
+    limits: &params::ParamLimits,
+) -> Vec<Option<SqlDataType>> {
+    let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+    let mut out: Vec<Option<SqlDataType>> = vec![None; ncols];
+    if !limits.cnxninfo.supports_describeparam {
+        return out;
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        if rows
+            .iter()
+            .any(|row| matches!(row.get(i), Some(ParamValue::Null)))
+        {
+            *slot = Some(params::describe_param_type(hstmt, i));
+        }
+    }
+    out
 }
 
 fn prepare(hstmt: HStmt, ctx: &ExecCtx, on_err: &impl Fn(&'static str) -> PyErr) -> PyResult<()> {

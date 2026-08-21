@@ -30,6 +30,14 @@ use crate::{async_bridge, env};
 // SQLGetInfo bound with a raw u16 info type: odbc-sys models InfoType as an enum
 // that doesn't cover everything in the aInfoTypes table.
 extern "system" {
+    #[link_name = "SQLSetConnectAttrW"]
+    fn RawSQLSetConnectAttrW(
+        hdbc: HDbc,
+        attribute: i32,
+        value: Pointer,
+        string_length: i32,
+    ) -> SqlReturn;
+
     #[link_name = "SQLGetInfo"]
     fn RawSQLGetInfo(
         hdbc: HDbc,
@@ -49,6 +57,7 @@ const SQL_AUTOCOMMIT_OFF: usize = 0;
 const SQL_AUTOCOMMIT_ON: usize = 1;
 const SQL_MODE_READ_ONLY: usize = 1;
 const SQL_NEED_LONG_DATA_LEN: u16 = 111;
+const SQL_DESCRIBE_PARAMETER: u16 = 10002;
 
 pub type ConverterMap = Arc<Mutex<HashMap<i32, Py<PyAny>>>>;
 
@@ -364,6 +373,62 @@ impl Connection {
         self.converters.lock().unwrap().clear();
     }
 
+    /// Set a raw connection attribute via SQLSetConnectAttr (int or string value).
+    #[pyo3(signature = (attr_id, value, /))]
+    fn set_attr(
+        &self,
+        py: Python<'_>,
+        attr_id: i32,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        enum AttrValue {
+            Int(isize),
+            Text(Vec<u16>),
+        }
+        let attr = if let Ok(i) = value.extract::<isize>() {
+            AttrValue::Int(i)
+        } else if let Ok(s) = value.extract::<String>() {
+            // NUL-terminated: the length is passed as SQL_NTS.
+            AttrValue::Text(s.encode_utf16().chain(std::iter::once(0)).collect())
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "set_attr value must be a string or integer, not '{}'",
+                value.get_type().name()?
+            )));
+        };
+        dispatch_future(py, self.channel()?, move |state| {
+            if state.hdbc == 0 {
+                return Err(closed_connection_err());
+            }
+            let ret = match &attr {
+                AttrValue::Int(i) => unsafe {
+                    RawSQLSetConnectAttrW(
+                        state.hdbc as HDbc,
+                        attr_id,
+                        *i as Pointer,
+                        odbc_sys::IS_INTEGER,
+                    )
+                },
+                AttrValue::Text(w) => unsafe {
+                    RawSQLSetConnectAttrW(
+                        state.hdbc as HDbc,
+                        attr_id,
+                        w.as_ptr() as Pointer,
+                        odbc_sys::NTS as i32,
+                    )
+                },
+            };
+            if !succeeded(ret) {
+                return Err(error_from_handle(
+                    "SQLSetConnectAttr",
+                    HandleType::Dbc,
+                    state.hdbc as Handle,
+                ));
+            }
+            Ok(Box::new(|py: Python<'_>| Ok(py.None())) as Finisher)
+        })
+    }
+
     /// Retrieve driver/data source information via SQLGetInfo.
     #[pyo3(signature = (infotype, /))]
     fn getinfo(&self, py: Python<'_>, infotype: u32) -> PyResult<Py<PyAny>> {
@@ -509,6 +574,68 @@ impl Drop for Connection {
     }
 }
 
+/// Probe driver capabilities (ported from CnxnInfo_New in cnxninfo.cpp).
+fn probe_cnxninfo(hdbc: Handle) -> worker::CnxnInfo {
+    let mut info = worker::CnxnInfo::default();
+
+    let yesno = |infotype: u16| -> Option<bool> {
+        let mut buf = [0u8; 4];
+        let mut cch: i16 = 0;
+        let ret = unsafe {
+            RawSQLGetInfo(
+                hdbc as HDbc,
+                infotype,
+                buf.as_mut_ptr() as Pointer,
+                buf.len() as i16,
+                &mut cch,
+            )
+        };
+        succeeded(ret).then_some(buf[0] == b'Y')
+    };
+    info.need_long_data_len = yesno(SQL_NEED_LONG_DATA_LEN).unwrap_or(false);
+    info.supports_describeparam = yesno(SQL_DESCRIBE_PARAMETER).unwrap_or(false);
+
+    // COLUMN_SIZE (3rd column) of SQLGetTypeInfo, per type (GetColumnSize in
+    // cnxninfo.cpp; a fresh HSTMT each time, as some drivers dislike reuse).
+    let column_size = |sqltype: i16, out: &mut usize| {
+        let mut hstmt: Handle = std::ptr::null_mut();
+        if !succeeded(unsafe { odbc_sys::SQLAllocHandle(HandleType::Stmt, hdbc, &mut hstmt) }) {
+            return;
+        }
+        let hstmt = hstmt as odbc_sys::HStmt;
+        let mut size: i32 = 0;
+        let mut ind: odbc_sys::Len = 0;
+        let ok = unsafe {
+            succeeded(odbc_sys::SQLGetTypeInfo(
+                hstmt,
+                odbc_sys::SqlDataType(sqltype),
+            )) && succeeded(odbc_sys::SQLFetch(hstmt))
+                && succeeded(odbc_sys::SQLGetData(
+                    hstmt,
+                    3,
+                    odbc_sys::CDataType::SLong,
+                    &mut size as *mut i32 as Pointer,
+                    4,
+                    &mut ind,
+                ))
+        };
+        if ok && size >= 1 && ind != odbc_sys::NULL_DATA {
+            *out = size as usize;
+        }
+        unsafe {
+            let _ = odbc_sys::SQLFreeHandle(HandleType::Stmt, hstmt as Handle);
+        }
+    };
+    column_size(12, &mut info.varchar_maxlength); // SQL_VARCHAR
+    column_size(-9, &mut info.wvarchar_maxlength); // SQL_WVARCHAR
+    column_size(-3, &mut info.binary_maxlength); // SQL_VARBINARY
+    let mut dt: usize = info.datetime_precision as usize;
+    column_size(93, &mut dt); // SQL_TYPE_TIMESTAMP
+    info.datetime_precision = dt as i32;
+
+    info
+}
+
 fn driver_completion_from_int(value: i32) -> PyResult<DriverConnectOption> {
     // Values validated by the Python-level connect() wrapper, like mod_connect.
     match value {
@@ -617,20 +744,7 @@ fn do_connect(
         }
     }
 
-    // Whether long DAE parameters must declare their length up front
-    // (SQL_NEED_LONG_DATA_LEN; see CnxnInfo in cnxninfo.cpp).
-    let mut buf = [0u8; 4];
-    let mut cch: i16 = 0;
-    let ret = unsafe {
-        RawSQLGetInfo(
-            hdbc as HDbc,
-            SQL_NEED_LONG_DATA_LEN,
-            buf.as_mut_ptr() as Pointer,
-            buf.len() as i16,
-            &mut cch,
-        )
-    };
-    state.need_long_data_len = succeeded(ret) && buf[0] == b'Y';
+    state.cnxninfo = probe_cnxninfo(hdbc);
 
     state.hdbc = hdbc as usize;
     state.hdbc_public.store(hdbc as usize, Ordering::Relaxed);

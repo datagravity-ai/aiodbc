@@ -348,19 +348,23 @@ async def test_nextset(cursor: pyodbc.Cursor):
         select i from t1 where i >= 2 order by i
         """)
 
-    for i, row in enumerate(cursor):
+    i = 0
+    async for row in cursor:
         assert i == row.i
+        i += 1
 
     assert await cursor.nextset()
 
-    for i, row in enumerate(cursor):
+    i = 0
+    async for row in cursor:
         assert i + 2 == row.i
+        i += 1
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='https://github.com/FreeTDS/freetds/issues/230')
 async def test_nextset_with_raiserror(cursor: pyodbc.Cursor):
     await cursor.execute("select i = 1; RAISERROR('c', 16, 1);")
-    row = next(cursor)
+    row = await anext(cursor)
     assert row.i == 1
     with pytest.raises(pyodbc.ProgrammingError):
         await cursor.nextset()
