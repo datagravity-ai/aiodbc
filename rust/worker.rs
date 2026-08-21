@@ -97,7 +97,7 @@ pub type Finisher = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 pub fn spawn(autocommit: Arc<AtomicBool>, hdbc_public: Arc<AtomicUsize>) -> PyResult<Sender<Task>> {
     let (tx, rx): (Sender<Task>, Receiver<Task>) = channel();
     std::thread::Builder::new()
-        .name("pyodbc-connection".into())
+        .name("aiodbc-connection".into())
         .spawn(move || {
             let mut state = ConnState {
                 hdbc: 0,
@@ -115,7 +115,7 @@ pub fn spawn(autocommit: Arc<AtomicBool>, hdbc_public: Arc<AtomicUsize>) -> PyRe
             // free the handle so the database is not left with a dangling session.
             state.clear();
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to spawn pyodbc worker: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to spawn aiodbc worker: {e}")))?;
     Ok(tx)
 }
 

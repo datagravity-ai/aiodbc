@@ -95,7 +95,7 @@ impl Default for CursorShared {
     }
 }
 
-#[pyclass(module = "pyodbc")]
+#[pyclass(module = "aiodbc")]
 pub struct Cursor {
     tx: Sender<Task>,
     connection: Py<Connection>,
@@ -154,7 +154,7 @@ fn extract_param_row(row: &Bound<'_, PyAny>, unicode_enc: &TextEnc) -> PyResult<
 }
 
 fn module_flag(py: Python<'_>, name: &str) -> bool {
-    py.import("pyodbc")
+    py.import("aiodbc")
         .and_then(|m| m.getattr(name))
         .and_then(|v| v.extract())
         .unwrap_or(false)
@@ -1281,7 +1281,7 @@ impl Cursor {
 
             Ok(Box::new(move |py: Python<'_>| {
                 // Catalog result columns are ALWAYS lowercased, regardless of
-                // pyodbc.lowercase (create_name_map(cur, cCols, true) in cursor.cpp).
+                // aiodbc.lowercase (create_name_map(cur, cCols, true) in cursor.cpp).
                 let (description, name_map) =
                     build_description(py, &raw_cols, true, native_uuid, &converter_types)?;
                 let mut guard = shared.lock().unwrap();

@@ -1,7 +1,7 @@
 """
-pyodbc - an asyncio-native DB API 2.0 module for ODBC, implemented in Rust.
+aiodbc - an asyncio-native DB API 2.0 module for ODBC, implemented in Rust.
 
-The compiled Rust core is pyodbc._core; this module assembles the public API on
+The compiled Rust core is aiodbc._core; this module assembles the public API on
 top of it.  See docs/rust-asyncio-rewrite-plan.md for the design.
 """
 
@@ -12,9 +12,9 @@ from importlib.metadata import version as _dist_version
 
 # ODBC constants, the exception hierarchy, Connection/Cursor/Row, drivers() and
 # data_sources() all come from the Rust core.
-from pyodbc._core import *  # noqa: F401,F403
-from pyodbc import _core
-from pyodbc._core import data_sources as dataSources  # noqa: F401,N812  (historical name)
+from aiodbc._core import *  # noqa: F401,F403
+from aiodbc import _core
+from aiodbc._core import data_sources as dataSources  # noqa: F401,N812  (historical name)
 
 # https://peps.python.org/pep-0249/#globals
 apilevel = '2.0'
@@ -24,7 +24,7 @@ threadsafety = 1
 # The single source of truth for the version is pyproject.toml (see CLAUDE.md);
 # maturin records it in the installed distribution's metadata.
 try:
-    version = _dist_version('pyodbc')
+    version = _dist_version('aiodbc')
 except _PackageNotFoundError:  # e.g. the module was imported straight from a build dir
     version = '0.0.0.dev0'
 
@@ -77,12 +77,12 @@ getDecimalSeparator = _core.get_decimal_separator  # noqa: N816
 
 
 def __getattr__(name):
-    # pyodbc.henv: the shared ODBC environment handle, allocated on first use like
+    # aiodbc.henv: the shared ODBC environment handle, allocated on first use like
     # the C++ module's mod_getattr.
     if name == 'henv':
         import ctypes
         return ctypes.c_void_p(_core._henv())
-    raise AttributeError(f"module 'pyodbc' has no attribute '{name}'")
+    raise AttributeError(f"module 'aiodbc' has no attribute '{name}'")
 
 
 # Map DB API recommended connect() keywords to ODBC connection string keywords,
@@ -97,7 +97,7 @@ _VALID_DRIVER_COMPLETION = (0, 1, 2, 3)
 
 class _PendingConnection:
     """What connect() returns: awaitable, and usable as an async context manager,
-    so both ``cnxn = await pyodbc.connect(cs)`` and ``async with pyodbc.connect(cs)
+    so both ``cnxn = await aiodbc.connect(cs)`` and ``async with aiodbc.connect(cs)
     as cnxn:`` work.  The ODBC connection is not opened until awaited/entered."""
 
     __slots__ = ('_args', '_future', '_cnxn')
@@ -130,7 +130,7 @@ def connect(connstring=None, /, **kwargs):
     """Open an ODBC connection.  Returns an awaitable that resolves to a
     Connection, also usable directly as an async context manager.
 
-    Keyword arguments understood by pyodbc itself: autocommit, readonly, timeout,
+    Keyword arguments understood by aiodbc itself: autocommit, readonly, timeout,
     encoding, attrs_before, driver_completion.  All other keyword arguments are
     appended to the connection string as "key=value;" pairs (with the DB API
     aliases user->uid, password->pwd, host->server applied).

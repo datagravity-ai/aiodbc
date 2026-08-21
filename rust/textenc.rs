@@ -20,7 +20,7 @@ pub const SQL_WMETADATA: i32 = -888;
 #[derive(Clone, Copy, PartialEq)]
 pub enum OptEnc {
     Utf8,
-    // "utf-16" means native order (pyodbc never adds a BOM when encoding).
+    // "utf-16" means native order (aiodbc never adds a BOM when encoding).
     Utf16Ne,
     Utf16Le,
     Utf16Be,
@@ -54,7 +54,7 @@ impl TextEnc {
     }
 }
 
-/// The four per-connection encodings, with the pyodbc defaults (all UTF-16 in
+/// The four per-connection encodings, with the aiodbc defaults (all UTF-16 in
 /// native byte order, read/written as SQL_C_WCHAR; see connection.cpp).
 #[derive(Clone)]
 pub struct ConnEncodings {

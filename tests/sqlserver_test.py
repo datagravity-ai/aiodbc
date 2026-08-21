@@ -12,7 +12,7 @@ from decimal import Decimal
 from datetime import date, time, datetime
 from functools import lru_cache
 
-import pyodbc
+import aiodbc
 import pytest
 
 
@@ -31,15 +31,15 @@ CNXNSTR = os.environ.get('PYODBC_SQLSERVER', 'DSN=pyodbc-sqlserver')
 
 
 async def connect(autocommit=False, attrs_before=None):
-    return await pyodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
+    return await aiodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
 
 
 async def _module_getinfo(info):
     return await (await connect()).getinfo(info)
 
-DRIVER = asyncio.run(_module_getinfo(pyodbc.SQL_DRIVER_NAME))
+DRIVER = asyncio.run(_module_getinfo(aiodbc.SQL_DRIVER_NAME))
 DRIVER_VERSION = tuple(
-    int(n) for n in asyncio.run(_module_getinfo(pyodbc.SQL_DRIVER_VER)).split("."))
+    int(n) for n in asyncio.run(_module_getinfo(aiodbc.SQL_DRIVER_VER)).split("."))
 IS_FREETDS   = bool(re.search(r'(tsodbc|tdsodbc)', DRIVER, flags=re.IGNORECASE))
 IS_MSODBCSQL = bool(re.search(r'(msodbcsql|sqlncli|sqlsrv32\.dll)', DRIVER, re.IGNORECASE))
 
@@ -68,7 +68,7 @@ SQLSERVER_YEAR = asyncio.run(_get_sqlserver_year())
 
 
 @pytest.fixture
-async def cursor() -> Iterator[pyodbc.Cursor]:
+async def cursor() -> Iterator[aiodbc.Cursor]:
     cnxn = await connect()
     cur = cnxn.cursor()
 
@@ -84,29 +84,29 @@ async def cursor() -> Iterator[pyodbc.Cursor]:
         await cnxn.close()
 
 
-async def test_text(cursor: pyodbc.Cursor):
+async def test_text(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'text')
 
 
-async def test_varchar(cursor: pyodbc.Cursor):
+async def test_varchar(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'varchar')
 
 
-async def test_nvarchar(cursor: pyodbc.Cursor):
+async def test_nvarchar(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'nvarchar')
 
 
-async def test_varbinary(cursor: pyodbc.Cursor):
+async def test_varbinary(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'varbinary')
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2005, reason='(max) not supported until 2005')
-async def test_unicode_longmax(cursor: pyodbc.Cursor):
+async def test_unicode_longmax(cursor: aiodbc.Cursor):
     # Issue 188:	Segfault when fetching NVARCHAR(MAX) data over 511 bytes
     await cursor.execute("select cast(replicate(N'x', 512) as nvarchar(max))")
 
 
-async def test_char(cursor: pyodbc.Cursor):
+async def test_char(cursor: aiodbc.Cursor):
     value = "testing"
     await cursor.execute("create table t1(s char(7))")
     await cursor.execute("insert into t1 values(?)", "testing")
@@ -114,16 +114,16 @@ async def test_char(cursor: pyodbc.Cursor):
     assert v == value
 
 
-async def test_int(cursor: pyodbc.Cursor):
+async def test_int(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'int', [None, -1, 0, 1, 12345678])
 
 
-async def test_bigint(cursor: pyodbc.Cursor):
+async def test_bigint(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'bigint', [None, -1, 0, 1, 0x123456789, 0x7FFFFFFF,
                                           0xFFFFFFFF, 0x123456789])
 
 
-async def test_overflow_int(cursor: pyodbc.Cursor):
+async def test_overflow_int(cursor: aiodbc.Cursor):
     # python allows integers of any size, bigger than an 8 byte int can contain
     value = 9999999999999999999999999999999999999
     await cursor.execute("create table t1(d bigint)")
@@ -133,14 +133,14 @@ async def test_overflow_int(cursor: pyodbc.Cursor):
     assert result == []
 
 
-async def test_float(cursor: pyodbc.Cursor):
+async def test_float(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'float', [None, -200, -1, 0, 1, 1234.5, -200, .00012345])
 
 
-async def test_non_numeric_float(cursor: pyodbc.Cursor):
+async def test_non_numeric_float(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(d float)")
     for value in (float('+Infinity'), float('-Infinity'), float('NaN')):
-        with pytest.raises(pyodbc.ProgrammingError):
+        with pytest.raises(aiodbc.ProgrammingError):
             await cursor.execute("insert into t1 values (?)", value)
     if IS_FREETDS:
         # Give the driver a chance to unconfuse itself. Without creating and closing
@@ -153,40 +153,40 @@ async def test_non_numeric_float(cursor: pyodbc.Cursor):
 
 
 def test_drivers():
-    p = pyodbc.drivers()
+    p = aiodbc.drivers()
     assert isinstance(p, list)
 
 
 def test_datasources():
-    p = pyodbc.dataSources()
+    p = aiodbc.dataSources()
     assert isinstance(p, dict)
 
 
 async def test_getinfo_string():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
+    value = await cnxn.getinfo(aiodbc.SQL_CATALOG_NAME_SEPARATOR)
     assert isinstance(value, str)
 
 
 async def test_getinfo_bool():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
+    value = await cnxn.getinfo(aiodbc.SQL_ACCESSIBLE_TABLES)
     assert isinstance(value, bool)
 
 
 async def test_getinfo_int():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
+    value = await cnxn.getinfo(aiodbc.SQL_DEFAULT_TXN_ISOLATION)
     assert isinstance(value, int)
 
 
 async def test_getinfo_smallint():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
+    value = await cnxn.getinfo(aiodbc.SQL_CONCAT_NULL_BEHAVIOR)
     assert isinstance(value, int)
 
 
-async def test_no_fetch(cursor: pyodbc.Cursor):
+async def test_no_fetch(cursor: aiodbc.Cursor):
     # Issue 89 with FreeTDS: Multiple selects (or catalog functions that issue selects) without
     # fetches seem to confuse the driver.
     await cursor.execute('select 1')
@@ -194,7 +194,7 @@ async def test_no_fetch(cursor: pyodbc.Cursor):
     await cursor.execute('select 1')
 
 
-async def test_decode_meta(cursor: pyodbc.Cursor):
+async def test_decode_meta(cursor: aiodbc.Cursor):
     """
     Ensure column names with non-ASCII characters are converted using the configured encodings.
     """
@@ -205,16 +205,16 @@ async def test_decode_meta(cursor: pyodbc.Cursor):
     assert cursor.description[0][0] == "Tipología"
 
 
-async def test_exc_integrity(cursor: pyodbc.Cursor):
+async def test_exc_integrity(cursor: aiodbc.Cursor):
     "Make sure an IntegretyError is raised"
     # This is really making sure we are properly encoding and comparing the SQLSTATEs.
     await cursor.execute("create table t1(s1 varchar(10) primary key)")
     await cursor.execute("insert into t1 values ('one')")
-    with pytest.raises(pyodbc.IntegrityError):
+    with pytest.raises(aiodbc.IntegrityError):
         await cursor.execute("insert into t1 values ('one')")
 
 
-async def test_multiple_bindings(cursor: pyodbc.Cursor):
+async def test_multiple_bindings(cursor: aiodbc.Cursor):
     "More than one bind and select on a cursor"
     await cursor.execute("create table t1(n int)")
     await cursor.execute("insert into t1 values (?)", 1)
@@ -225,7 +225,7 @@ async def test_multiple_bindings(cursor: pyodbc.Cursor):
         await cursor.execute("select n from t1 where n < 3")
 
 
-async def test_different_bindings(cursor: pyodbc.Cursor):
+async def test_different_bindings(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(n int)")
     await cursor.execute("create table t2(d datetime)")
     await cursor.execute("insert into t1 values (?)", 1)
@@ -236,7 +236,7 @@ SMALL_FENCEPOST_SIZES = [None, 0, 1, 255, 256, 510, 511, 512, 1023, 1024, 2047, 
 LARGE_FENCEPOST_SIZES = SMALL_FENCEPOST_SIZES + [4095, 4096, 4097, 10 * 1024, 20 * 1024]
 
 
-async def _test_vartype(cursor: pyodbc.Cursor, datatype):
+async def _test_vartype(cursor: aiodbc.Cursor, datatype):
 
     is_binary = datatype in {"blob", "varbinary"}
     encoding = "utf8" if is_binary else None
@@ -260,9 +260,9 @@ async def _test_vartype(cursor: pyodbc.Cursor, datatype):
         for length in lengths:
 
             # FreeTDS did not support SQLDescribeParam until version 1.5.16 (see ticket
-            # https://github.com/FreeTDS/freetds/issues/104), so pyodbc had to infer the
+            # https://github.com/FreeTDS/freetds/issues/104), so aiodbc had to infer the
             # SQL type from the Python value. None carries no type information, causing
-            # pyodbc to fall back to SQL_VARCHAR, which SQL Server rejects for binary
+            # aiodbc to fall back to SQL_VARCHAR, which SQL Server rejects for binary
             # columns.
             if length is None and IS_FREETDS and is_binary and DRIVER_VERSION < (1, 5, 16):
                 continue
@@ -273,7 +273,7 @@ async def _test_vartype(cursor: pyodbc.Cursor, datatype):
 
             try:
                 await cursor.execute("insert into t1 values(?)", value)
-            except pyodbc.Error as ex:
+            except aiodbc.Error as ex:
                 if value is None:
                     msg = f"{datatype} insert of NULL failed"
                 else:
@@ -286,7 +286,7 @@ async def _test_vartype(cursor: pyodbc.Cursor, datatype):
         await cursor.execute("drop table t1")
 
 
-async def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
+async def _test_scalar(cursor: aiodbc.Cursor, datatype, values):
     """
     A simple test wrapper for types that are identical when written and read.
     """
@@ -298,46 +298,46 @@ async def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
         assert v == value
 
 
-def test_noscan(cursor: pyodbc.Cursor):
+def test_noscan(cursor: aiodbc.Cursor):
     assert cursor.noscan is False
     cursor.noscan = True
     assert cursor.noscan is True
 
 
-async def test_nonnative_uuid(cursor: pyodbc.Cursor):
+async def test_nonnative_uuid(cursor: aiodbc.Cursor):
     # Resetting the native_uuid flag should force return of a text value.
     # Note that SQL Server seems to always return uppercase.
     value = uuid.uuid4()
     await cursor.execute("create table t1(n uniqueidentifier)")
     await cursor.execute("insert into t1 values (?)", value)
 
-    saved_native_uuid = pyodbc.native_uuid
+    saved_native_uuid = aiodbc.native_uuid
     try:
-        pyodbc.native_uuid = False
+        aiodbc.native_uuid = False
         result = await (await cursor.execute("select n from t1")).fetchval()
     finally:
-        pyodbc.native_uuid = saved_native_uuid
+        aiodbc.native_uuid = saved_native_uuid
     assert isinstance(result, str)
     assert result == str(value).upper()
 
 
-async def test_native_uuid(cursor: pyodbc.Cursor):
+async def test_native_uuid(cursor: aiodbc.Cursor):
     # With the native_uuid flag set we should get a uuid.UUID object.
     value = uuid.uuid4()
     await cursor.execute("create table t1(n uniqueidentifier)")
     await cursor.execute("insert into t1 values (?)", value)
 
-    saved_native_uuid = pyodbc.native_uuid
+    saved_native_uuid = aiodbc.native_uuid
     try:
-        pyodbc.native_uuid = True
+        aiodbc.native_uuid = True
         result = await (await cursor.execute("select n from t1")).fetchval()
     finally:
-        pyodbc.native_uuid = saved_native_uuid
+        aiodbc.native_uuid = saved_native_uuid
     assert isinstance(result, uuid.UUID)
     assert value == result
 
 
-async def test_nextset(cursor: pyodbc.Cursor):
+async def test_nextset(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(i int)")
     for i in range(4):
         await cursor.execute("insert into t1(i) values(?)", i)
@@ -362,15 +362,15 @@ async def test_nextset(cursor: pyodbc.Cursor):
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='https://github.com/FreeTDS/freetds/issues/230')
-async def test_nextset_with_raiserror(cursor: pyodbc.Cursor):
+async def test_nextset_with_raiserror(cursor: aiodbc.Cursor):
     await cursor.execute("select i = 1; RAISERROR('c', 16, 1);")
     row = await anext(cursor)
     assert row.i == 1
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.nextset()
 
 
-async def test_fixed_unicode(cursor: pyodbc.Cursor):
+async def test_fixed_unicode(cursor: aiodbc.Cursor):
     value = "t\xebsting"
     await cursor.execute("create table t1(s nchar(7))")
     await cursor.execute("insert into t1 values(?)", "t\xebsting")
@@ -381,7 +381,7 @@ async def test_fixed_unicode(cursor: pyodbc.Cursor):
     assert v == value
 
 
-async def test_chinese(cursor: pyodbc.Cursor):
+async def test_chinese(cursor: aiodbc.Cursor):
     v = '我的'
     await cursor.execute("SELECT N'我的' AS [Name]")
     row = await cursor.fetchone()
@@ -392,7 +392,7 @@ async def test_chinese(cursor: pyodbc.Cursor):
     assert rows[0][0] == v
 
 
-async def test_bit(cursor: pyodbc.Cursor):
+async def test_bit(cursor: aiodbc.Cursor):
     value = True
     await cursor.execute("create table t1(b bit)")
     await cursor.execute("insert into t1 values (?)", value)
@@ -401,7 +401,7 @@ async def test_bit(cursor: pyodbc.Cursor):
     assert v == value
 
 
-async def test_decimal(cursor: pyodbc.Cursor):
+async def test_decimal(cursor: aiodbc.Cursor):
     # From test provided by planders (thanks!) in Issue 91
 
     for mode in (True, False):
@@ -431,7 +431,7 @@ async def test_decimal(cursor: pyodbc.Cursor):
             assert v == value
 
 
-async def test_decimal_e(cursor: pyodbc.Cursor):
+async def test_decimal_e(cursor: aiodbc.Cursor):
     """Ensure exponential notation decimals are properly handled"""
     value = Decimal((0, (1, 2, 3), 5))  # prints as 1.23E+7
     await cursor.execute("create table t1(d decimal(10, 2))")
@@ -440,7 +440,7 @@ async def test_decimal_e(cursor: pyodbc.Cursor):
     assert result == value
 
 
-async def test_subquery_params(cursor: pyodbc.Cursor):
+async def test_subquery_params(cursor: aiodbc.Cursor):
     """Ensure parameter markers work in a subquery"""
     await cursor.execute("create table t1(id integer, s varchar(20))")
     await cursor.execute("insert into t1 values (?,?)", 1, 'test')
@@ -472,18 +472,18 @@ async def test_close_cnxn():
 
     # Now that the connection is closed, we expect an exception.  (If the code attempts to use
     # the HSTMT, we'll get an access violation instead.)
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.execute("select * from t1")
 
 
-async def test_empty_string(cursor: pyodbc.Cursor):
+async def test_empty_string(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(s varchar(20))")
     await cursor.execute("insert into t1 values(?)", "")
 
 
 async def test_empty_string_encoding():
     cnxn = await connect()
-    cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='shift_jis')
+    cnxn.setdecoding(aiodbc.SQL_CHAR, encoding='shift_jis')
     value = ""
     cursor = cnxn.cursor()
     await cursor.execute("create table t1(s varchar(20))")
@@ -492,7 +492,7 @@ async def test_empty_string_encoding():
     assert v == value
 
 
-async def test_fixed_str(cursor: pyodbc.Cursor):
+async def test_fixed_str(cursor: aiodbc.Cursor):
     value = "testing"
     await cursor.execute("create table t1(s char(7))")
     await cursor.execute("insert into t1 values(?)", value)
@@ -503,14 +503,14 @@ async def test_fixed_str(cursor: pyodbc.Cursor):
     assert v == value
 
 
-async def test_empty_unicode(cursor: pyodbc.Cursor):
+async def test_empty_unicode(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(s nvarchar(20))")
     await cursor.execute("insert into t1 values(?)", "")
 
 
 async def test_empty_unicode_encoding():
     cnxn = await connect()
-    cnxn.setdecoding(pyodbc.SQL_CHAR, encoding='shift_jis')
+    cnxn.setdecoding(aiodbc.SQL_CHAR, encoding='shift_jis')
     value = ""
     cursor = cnxn.cursor()
     await cursor.execute("create table t1(s nvarchar(20))")
@@ -519,7 +519,7 @@ async def test_empty_unicode_encoding():
     assert v == value
 
 
-async def test_negative_row_index(cursor: pyodbc.Cursor):
+async def test_negative_row_index(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(s varchar(20))")
     await cursor.execute("insert into t1 values(?)", "1")
     row = await (await cursor.execute("select * from t1")).fetchone()
@@ -528,12 +528,12 @@ async def test_negative_row_index(cursor: pyodbc.Cursor):
 
 
 def test_version():
-    assert len(pyodbc.version.split('.')) == 3  # 1.3.1 etc.
+    assert len(aiodbc.version.split('.')) == 3  # 1.3.1 etc.
 
 
 @pytest.mark.skipif(IS_MSODBCSQL and SQLSERVER_YEAR < 2008,
                     reason='Date not supported until 2008?')
-async def test_date(cursor: pyodbc.Cursor):
+async def test_date(cursor: aiodbc.Cursor):
     value = date.today()
 
     await cursor.execute("create table t1(d date)")
@@ -546,7 +546,7 @@ async def test_date(cursor: pyodbc.Cursor):
 
 @pytest.mark.skipif(IS_MSODBCSQL and SQLSERVER_YEAR < 2008,
                     reason='Time not supported until 2008?')
-async def test_time(cursor: pyodbc.Cursor):
+async def test_time(cursor: aiodbc.Cursor):
     value = datetime.now().time()
 
     # We aren't yet writing values using the new extended time type so the value written to the
@@ -561,7 +561,7 @@ async def test_time(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_datetime(cursor: pyodbc.Cursor):
+async def test_datetime(cursor: aiodbc.Cursor):
     value = datetime(2007, 1, 15, 3, 4, 5)
 
     await cursor.execute("create table t1(dt datetime)")
@@ -572,7 +572,7 @@ async def test_datetime(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_datetime_fraction(cursor: pyodbc.Cursor):
+async def test_datetime_fraction(cursor: aiodbc.Cursor):
     # SQL Server supports milliseconds, but Python's datetime supports nanoseconds, so the most
     # granular datetime supported is xxx000.
 
@@ -586,8 +586,8 @@ async def test_datetime_fraction(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_datetime_fraction_rounded(cursor: pyodbc.Cursor):
-    # SQL Server supports milliseconds, but Python's datetime supports nanoseconds.  pyodbc
+async def test_datetime_fraction_rounded(cursor: aiodbc.Cursor):
+    # SQL Server supports milliseconds, but Python's datetime supports nanoseconds.  aiodbc
     # rounds down to what the database supports.
 
     full    = datetime(2007, 1, 15, 3, 4, 5, 123456)
@@ -601,7 +601,7 @@ async def test_datetime_fraction_rounded(cursor: pyodbc.Cursor):
     assert rounded == result
 
 
-async def test_datetime2(cursor: pyodbc.Cursor):
+async def test_datetime2(cursor: aiodbc.Cursor):
     value = datetime(2007, 1, 15, 3, 4, 5)
 
     await cursor.execute("create table t1(dt datetime2)")
@@ -612,7 +612,7 @@ async def test_datetime2(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_sp_results(cursor: pyodbc.Cursor):
+async def test_sp_results(cursor: aiodbc.Cursor):
     await cursor.execute(
         """
         Create procedure proc1
@@ -626,7 +626,7 @@ async def test_sp_results(cursor: pyodbc.Cursor):
     assert isinstance(rows[0].refdate, datetime)
 
 
-async def test_sp_results_from_temp(cursor: pyodbc.Cursor):
+async def test_sp_results_from_temp(cursor: aiodbc.Cursor):
 
     # Note: I've used "set nocount on" so that we don't get the number of rows deleted from
     # #tmptable.  If you don't do this, you'd need to call nextset() once to skip it.
@@ -652,7 +652,7 @@ async def test_sp_results_from_temp(cursor: pyodbc.Cursor):
     assert isinstance(rows[0].refdate, datetime)
 
 
-async def test_sp_results_from_vartbl(cursor: pyodbc.Cursor):
+async def test_sp_results_from_vartbl(cursor: aiodbc.Cursor):
     await cursor.execute(
         """
         Create procedure proc1
@@ -673,7 +673,7 @@ async def test_sp_results_from_vartbl(cursor: pyodbc.Cursor):
     assert isinstance(rows[0].refdate, datetime)
 
 
-async def test_sp_with_dates(cursor: pyodbc.Cursor):
+async def test_sp_with_dates(cursor: aiodbc.Cursor):
     # Reported in the forums that passing two datetimes to a stored procedure doesn't work.
     await cursor.execute(
         """
@@ -695,7 +695,7 @@ async def test_sp_with_dates(cursor: pyodbc.Cursor):
     assert rows[0][0] == 0   # 0 years apart
 
 
-async def test_sp_with_none(cursor: pyodbc.Cursor):
+async def test_sp_with_none(cursor: aiodbc.Cursor):
     # Reported in the forums that passing None caused an error.
     await cursor.execute(
         """
@@ -722,7 +722,7 @@ async def test_sp_with_none(cursor: pyodbc.Cursor):
 #
 
 
-async def test_rowcount_delete(cursor: pyodbc.Cursor):
+async def test_rowcount_delete(cursor: aiodbc.Cursor):
     # After DDL (DROP TABLE), rowcount is driver-defined per the ODBC spec.
     # Microsoft's driver might reliably return -1 here, but that's not true
     # for FreeTDS.
@@ -736,7 +736,7 @@ async def test_rowcount_delete(cursor: pyodbc.Cursor):
     assert cursor.rowcount == count
 
 
-async def test_rowcount_nodata(cursor: pyodbc.Cursor):
+async def test_rowcount_nodata(cursor: aiodbc.Cursor):
     """
     This represents a different code path than a delete that deleted something.
 
@@ -750,11 +750,11 @@ async def test_rowcount_nodata(cursor: pyodbc.Cursor):
     assert cursor.rowcount == 0
 
 
-async def test_rowcount_select(cursor: pyodbc.Cursor):
+async def test_rowcount_select(cursor: aiodbc.Cursor):
     """
     Ensure Cursor.rowcount is set properly after a select statement.
 
-    pyodbc calls SQLRowCount after each execute and sets Cursor.rowcount, but SQL Server 2005
+    aiodbc calls SQLRowCount after each execute and sets Cursor.rowcount, but SQL Server 2005
     returns -1 after a select statement, so we'll test for that behavior.  This is valid
     behavior according to the DB API specification, but people don't seem to like it.
     """
@@ -770,7 +770,7 @@ async def test_rowcount_select(cursor: pyodbc.Cursor):
     assert cursor.rowcount == -1
 
 
-async def test_rowcount_reset(cursor: pyodbc.Cursor):
+async def test_rowcount_reset(cursor: aiodbc.Cursor):
     "Ensure rowcount is reset after DDL"
     await cursor.execute("create table t1(i int)")
     count = 4
@@ -783,14 +783,14 @@ async def test_rowcount_reset(cursor: pyodbc.Cursor):
     assert cursor.rowcount == ddl_rowcount
 
 
-async def test_retcursor_delete(cursor: pyodbc.Cursor):
+async def test_retcursor_delete(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(i int)")
     await cursor.execute("insert into t1 values (1)")
     v = await cursor.execute("delete from t1")
     assert v == cursor
 
 
-async def test_retcursor_nodata(cursor: pyodbc.Cursor):
+async def test_retcursor_nodata(cursor: aiodbc.Cursor):
     """
     This represents a different code path than a delete that deleted something.
 
@@ -804,14 +804,14 @@ async def test_retcursor_nodata(cursor: pyodbc.Cursor):
     assert v == cursor
 
 
-async def test_retcursor_select(cursor: pyodbc.Cursor):
+async def test_retcursor_select(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(i int)")
     await cursor.execute("insert into t1 values (1)")
     v = await cursor.execute("select * from t1")
     assert v == cursor
 
 
-async def table_with_spaces(cursor: pyodbc.Cursor):
+async def table_with_spaces(cursor: aiodbc.Cursor):
     "Ensure we can select using [x z] syntax"
 
     try:
@@ -825,9 +825,9 @@ async def table_with_spaces(cursor: pyodbc.Cursor):
 
 
 async def test_lower_case():
-    "Ensure pyodbc.lowercase forces returned column names to lowercase."
+    "Ensure aiodbc.lowercase forces returned column names to lowercase."
     try:
-        pyodbc.lowercase = True
+        aiodbc.lowercase = True
         cnxn = await connect()
         cursor = cnxn.cursor()
 
@@ -840,10 +840,10 @@ async def test_lower_case():
         assert names == ["abc", "def"]
     finally:
         # Put it back so other tests don't fail.
-        pyodbc.lowercase = False
+        aiodbc.lowercase = False
 
 
-async def test_row_description(cursor: pyodbc.Cursor):
+async def test_row_description(cursor: aiodbc.Cursor):
     """
     Ensure Cursor.description is accessible as Row.cursor_description.
     """
@@ -853,7 +853,7 @@ async def test_row_description(cursor: pyodbc.Cursor):
     assert cursor.description == row.cursor_description
 
 
-async def test_temp_select(cursor: pyodbc.Cursor):
+async def test_temp_select(cursor: aiodbc.Cursor):
     # A project was failing to create temporary tables via select into.
     await cursor.execute("create table t1(s char(7))")
     await cursor.execute("insert into t1 values(?)", "testing")
@@ -867,7 +867,7 @@ async def test_temp_select(cursor: pyodbc.Cursor):
     assert v == "testing"
 
 
-async def test_executemany(cursor: pyodbc.Cursor):
+async def test_executemany(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b varchar(10))")
 
     params = [(i, str(i)) for i in range(1, 6)]
@@ -886,7 +886,7 @@ async def test_executemany(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-async def test_executemany_one(cursor: pyodbc.Cursor):
+async def test_executemany_one(cursor: aiodbc.Cursor):
     "Pass executemany a single sequence"
     await cursor.execute("create table t1(a int, b varchar(10))")
 
@@ -906,7 +906,7 @@ async def test_executemany_one(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-async def test_executemany_dae_0(cursor: pyodbc.Cursor):
+async def test_executemany_dae_0(cursor: aiodbc.Cursor):
     """
     DAE for 0-length value
     """
@@ -920,7 +920,7 @@ async def test_executemany_dae_0(cursor: pyodbc.Cursor):
     cursor.fast_executemany = False
 
 
-async def test_executemany_failure(cursor: pyodbc.Cursor):
+async def test_executemany_failure(cursor: aiodbc.Cursor):
     """
     Ensure that an exception is raised if one query in an executemany fails.
     """
@@ -930,11 +930,11 @@ async def test_executemany_failure(cursor: pyodbc.Cursor):
               ('error', 'not an int'),
               (3, 'good')]
 
-    with pytest.raises(pyodbc.Error):
+    with pytest.raises(aiodbc.Error):
         await cursor.executemany("insert into t1(a, b) value (?, ?)", params)
 
 
-async def test_row_slicing(cursor: pyodbc.Cursor):
+async def test_row_slicing(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b int, c int, d int)")
     await cursor.execute("insert into t1 values(1,2,3,4)")
 
@@ -950,7 +950,7 @@ async def test_row_slicing(cursor: pyodbc.Cursor):
     assert result is row
 
 
-async def test_row_repr(cursor: pyodbc.Cursor):
+async def test_row_repr(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b int, c int, d varchar(50))")
     await cursor.execute("insert into t1 values(1,2,3,'four')")
 
@@ -966,7 +966,7 @@ async def test_row_repr(cursor: pyodbc.Cursor):
     assert result == "(1,)"
 
 
-async def test_concatenation(cursor: pyodbc.Cursor):
+async def test_concatenation(cursor: aiodbc.Cursor):
     v2 = '0123456789' * 30
     v3 = '9876543210' * 30
 
@@ -979,7 +979,7 @@ async def test_concatenation(cursor: pyodbc.Cursor):
     assert row.both == v2 + v3
 
 
-async def test_view_select(cursor: pyodbc.Cursor):
+async def test_view_select(cursor: aiodbc.Cursor):
     # Reported in forum: Can't select from a view?  I think I do this a lot, but another test
     # never hurts.
 
@@ -1007,7 +1007,7 @@ async def test_autocommit():
     assert cnxn.autocommit is False
 
 
-async def test_sqlserver_callproc(cursor: pyodbc.Cursor):
+async def test_sqlserver_callproc(cursor: aiodbc.Cursor):
     try:
         await cursor.execute("drop procedure pyodbctest")
         await cursor.commit()
@@ -1029,7 +1029,7 @@ async def test_sqlserver_callproc(cursor: pyodbc.Cursor):
     await cursor.execute("exec pyodbctest 'hi'")
 
 
-async def test_skip(cursor: pyodbc.Cursor):
+async def test_skip(cursor: aiodbc.Cursor):
     # Insert 1, 2, and 3.  Fetch 1, skip 2, fetch 3.
 
     await cursor.execute("create table t1(id int)")
@@ -1052,20 +1052,20 @@ async def test_timeout():
     assert cnxn.timeout == 0
 
 
-async def test_sets_execute(cursor: pyodbc.Cursor):
+async def test_sets_execute(cursor: aiodbc.Cursor):
     # Only lists and tuples are allowed.
     await cursor.execute("create table t1 (word varchar (100))")
 
     words = {'a', 'b', 'c'}
 
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.execute("insert into t1 (word) values (?)", words)
 
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.executemany("insert into t1 (word) values (?)", words)
 
 
-async def test_row_execute(cursor: pyodbc.Cursor):
+async def test_row_execute(cursor: aiodbc.Cursor):
     "Ensure we can use a Row object as a parameter to execute"
     await cursor.execute("create table t1(n int, s varchar(10))")
     await cursor.execute("insert into t1 values (1, 'a')")
@@ -1076,7 +1076,7 @@ async def test_row_execute(cursor: pyodbc.Cursor):
     await cursor.execute("insert into t2 values (?, ?)", row)
 
 
-async def test_row_executemany(cursor: pyodbc.Cursor):
+async def test_row_executemany(cursor: aiodbc.Cursor):
     "Ensure we can use a Row object as a parameter to executemany"
     await cursor.execute("create table t1(n int, s varchar(10))")
 
@@ -1090,7 +1090,7 @@ async def test_row_executemany(cursor: pyodbc.Cursor):
     await cursor.executemany("insert into t2 values (?, ?)", rows)
 
 
-async def test_description(cursor: pyodbc.Cursor):
+async def test_description(cursor: aiodbc.Cursor):
     "Ensure cursor.description is correct"
 
     await cursor.execute("create table t1(n int, s varchar(8), d decimal(5,2))")
@@ -1124,7 +1124,7 @@ async def test_description(cursor: pyodbc.Cursor):
     assert t[6] is True    # nullable
 
 
-async def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_print(cursor: aiodbc.Cursor):
     """
     Ensure the Cursor.messages attribute is handled correctly with a simple PRINT statement.
     """
@@ -1161,7 +1161,7 @@ async def test_cursor_messages_with_print(cursor: pyodbc.Cursor):
 
 @pytest.mark.skipif(IS_FREETDS and DRIVER_VERSION < (1, 5, 15),
                     reason="FreeTDS ignores bind offset")
-async def test_cursor_messages_with_fast_executemany(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_fast_executemany(cursor: aiodbc.Cursor):
     """
     Ensure the Cursor.messages attribute is set with fast_executemany=True.
     """
@@ -1177,7 +1177,7 @@ async def test_cursor_messages_with_fast_executemany(cursor: pyodbc.Cursor):
     assert all(m[1].endswith('hello') for m in cursor.messages)
 
 
-async def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
+async def test_cursor_messages_with_stored_proc(cursor: aiodbc.Cursor):
     """
     Complex scenario to test the Cursor.messages attribute.
     """
@@ -1216,7 +1216,7 @@ async def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
 
     # result set 3: messages, no rows
     assert await cursor.nextset()
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.fetchall()
     msgs = [
         re.search(r'Message \d[ab]$', m[1]).group(0)
@@ -1226,19 +1226,19 @@ async def test_cursor_messages_with_stored_proc(cursor: pyodbc.Cursor):
 
     # result set 4: no rows, no messages
     assert not await cursor.nextset()
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.fetchall()
     assert not cursor.messages
 
 
-async def test_none_param(cursor: pyodbc.Cursor):
+async def test_none_param(cursor: aiodbc.Cursor):
     "Ensure None can be used for params other than the first"
     # Some driver/db versions would fail if NULL was not the first parameter because
     # SQLDescribeParam (only used with NULL) could not be used after the first call to
     # SQLBindParameter.  This means None always worked for the first column, but did not work
     # for later columns.
     #
-    # If SQLDescribeParam doesn't work, pyodbc would use VARCHAR which almost always worked.
+    # If SQLDescribeParam doesn't work, aiodbc would use VARCHAR which almost always worked.
     # However, binary/varbinary won't allow an implicit conversion.
 
     await cursor.execute("create table t1(n int, blob varbinary(max))")
@@ -1250,15 +1250,15 @@ async def test_none_param(cursor: pyodbc.Cursor):
     sql = "update t1 set n=?, blob=?"
     try:
         await cursor.execute(sql, 2, None)
-    except pyodbc.DataError:
+    except aiodbc.DataError:
         if IS_FREETDS:
-            # cnxn.getinfo(pyodbc.SQL_DESCRIBE_PARAMETER) returns False for FreeTDS, so pyodbc
+            # cnxn.getinfo(aiodbc.SQL_DESCRIBE_PARAMETER) returns False for FreeTDS, so aiodbc
             # can't call SQLDescribeParam to get the correct parameter type.  This can lead to
             # errors being returned from SQL Server when sp_prepexec is called, e.g., "Implicit
             # conversion from data type varchar to varbinary(max) is not allowed."
             #
             # So at least verify that the user can manually specify the parameter type
-            cursor.setinputsizes([(), (pyodbc.SQL_VARBINARY, None, None)])
+            cursor.setinputsizes([(), (aiodbc.SQL_VARBINARY, None, None)])
             await cursor.execute(sql, 2, None)
         else:
             raise
@@ -1283,7 +1283,7 @@ async def test_output_conversion():
     await cursor.execute("create table t1(n int, v varchar(10))")
     await cursor.execute("insert into t1 values (1, '123.45')")
 
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert1)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
@@ -1293,35 +1293,35 @@ async def test_output_conversion():
     assert value == '123.45'
 
     # Same but clear using remove_output_converter.
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert1)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
-    cnxn.remove_output_converter(pyodbc.SQL_VARCHAR)
+    cnxn.remove_output_converter(aiodbc.SQL_VARCHAR)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
     # Clear via add_output_converter, passing None for the converter function.
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert1)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
 
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, None)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, None)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
     # retrieve and temporarily replace converter (get_output_converter)
     #
     #   case_1: converter already registered
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert1)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert1)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
-    prev_converter = cnxn.get_output_converter(pyodbc.SQL_VARCHAR)
+    prev_converter = cnxn.get_output_converter(aiodbc.SQL_VARCHAR)
     assert prev_converter is not None
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert2)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert2)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'Y123.45Y'
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, prev_converter)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, prev_converter)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'X123.45X'
     #
@@ -1329,26 +1329,26 @@ async def test_output_conversion():
     cnxn.clear_output_converters()
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
-    prev_converter = cnxn.get_output_converter(pyodbc.SQL_VARCHAR)
+    prev_converter = cnxn.get_output_converter(aiodbc.SQL_VARCHAR)
     assert prev_converter is None
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, convert2)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, convert2)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == 'Y123.45Y'
-    cnxn.add_output_converter(pyodbc.SQL_VARCHAR, prev_converter)
+    cnxn.add_output_converter(aiodbc.SQL_VARCHAR, prev_converter)
     value = (await (await cursor.execute("select v from t1")).fetchone())[0]
     assert value == '123.45'
 
 
-async def test_too_large(cursor: pyodbc.Cursor):
+async def test_too_large(cursor: aiodbc.Cursor):
     """Ensure error raised if insert fails due to truncation"""
     value = 'x' * 1000
     await cursor.execute("create table t1(s varchar(800))")
 
-    with pytest.raises(pyodbc.Error):
+    with pytest.raises(aiodbc.Error):
         await cursor.execute("insert into t1 values (?)", value)
 
 
-async def test_row_equal(cursor: pyodbc.Cursor):
+async def test_row_equal(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(n int, s varchar(20))")
     await cursor.execute("insert into t1 values (1, 'test')")
     row1 = await (await cursor.execute("select n, s from t1")).fetchone()
@@ -1356,7 +1356,7 @@ async def test_row_equal(cursor: pyodbc.Cursor):
     assert row1 == row2
 
 
-async def test_row_gtlt(cursor: pyodbc.Cursor):
+async def test_row_gtlt(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(n int, s varchar(20))")
     await cursor.execute("insert into t1 values (1, 'test1')")
     await cursor.execute("insert into t1 values (1, 'test2')")
@@ -1387,7 +1387,7 @@ async def test_context_manager_success():
     assert rows[0][0] == 1
 
 
-async def test_context_manager_failure(cursor: pyodbc.Cursor):
+async def test_context_manager_failure(cursor: aiodbc.Cursor):
     "Ensure `with` rolls back if an exception is raised"
     cnxn = await connect()
     cursor = cnxn.cursor()
@@ -1399,7 +1399,7 @@ async def test_context_manager_failure(cursor: pyodbc.Cursor):
     await cursor.execute("insert into t1 values (1)")
     await cnxn.commit()
 
-    with pytest.raises(pyodbc.Error):
+    with pytest.raises(aiodbc.Error):
         async with cnxn:
             await cursor.execute("insert into t1 values (2)")
             await cursor.execute("delete from bogus")
@@ -1409,19 +1409,19 @@ async def test_context_manager_failure(cursor: pyodbc.Cursor):
     assert val == 1
 
 
-async def test_untyped_none(cursor: pyodbc.Cursor):
+async def test_untyped_none(cursor: aiodbc.Cursor):
     # From issue 129
     value = (await (await cursor.execute("select ?", None)).fetchone())[0]
     assert value is None
 
 
-async def test_large_update_nodata(cursor: pyodbc.Cursor):
+async def test_large_update_nodata(cursor: aiodbc.Cursor):
     await cursor.execute('create table t1(a varbinary(max))')
     hundredkb = b'x' * 100 * 1024
     await cursor.execute('update t1 set a=? where 1=0', (hundredkb,))
 
 
-async def test_func_param(cursor: pyodbc.Cursor):
+async def test_func_param(cursor: aiodbc.Cursor):
     try:
         await cursor.execute("drop function func1")
     except Exception:
@@ -1441,7 +1441,7 @@ async def test_func_param(cursor: pyodbc.Cursor):
     assert value == 'test'
 
 
-async def test_columns(cursor: pyodbc.Cursor):
+async def test_columns(cursor: aiodbc.Cursor):
     # When using aiohttp, `await cursor.primaryKeys('t1')` was raising the error
     #
     #   Error: TypeError: argument 2 must be str, not None
@@ -1488,7 +1488,7 @@ async def test_columns(cursor: pyodbc.Cursor):
         await cursor.execute(f"drop table {table_name}")
 
 
-async def test_table_privileges(cursor: pyodbc.Cursor):
+async def test_table_privileges(cursor: aiodbc.Cursor):
     # Confirm exposure of SQLTablePrivileges.  We're limited in what we can test, as
     # we can't control whether we're running with permission to create users or grant
     # permissions.  We can at least verify that the method generates a results set
@@ -1512,7 +1512,7 @@ async def test_statistics_unicode():
     # table name for good measure.
     suffix = uuid.uuid4().hex
     name = "ランドマーク_" + suffix
-    cnxn = await pyodbc.connect(CNXNSTR + f";APP=pyodbc_1457_{suffix}", autocommit=True)
+    cnxn = await aiodbc.connect(CNXNSTR + f";APP=pyodbc_1457_{suffix}", autocommit=True)
     cur = cnxn.cursor()
     await cur.execute(f"CREATE TABLE [{name}] (id INT PRIMARY KEY, foo INT)")
     await cur.execute(f"CREATE INDEX ix_foo ON [{name}] (foo)")
@@ -1527,17 +1527,17 @@ async def test_statistics_unicode():
         await cnxn.close()
 
 
-async def test_cancel(cursor: pyodbc.Cursor):
+async def test_cancel(cursor: aiodbc.Cursor):
     # I'm not sure how to reliably cause a hang to cancel, so for now we'll settle with
     # making sure SQLCancel is called correctly.
     await cursor.execute("select 1")
     cursor.cancel()
 
 
-async def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
+async def test_emoticons_as_parameter(cursor: aiodbc.Cursor):
     # https://github.com/mkleehammer/pyodbc/issues/423
     #
-    # When sending a varchar parameter, pyodbc is supposed to set ColumnSize to the number
+    # When sending a varchar parameter, aiodbc is supposed to set ColumnSize to the number
     # of characters.  Ensure it works even with 4-byte characters.
     #
     # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
@@ -1552,7 +1552,7 @@ async def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
     assert result == v
 
 
-async def test_emoticons_as_literal(cursor: pyodbc.Cursor):
+async def test_emoticons_as_literal(cursor: aiodbc.Cursor):
     # similar to `test_emoticons_as_parameter`, above, except for Unicode literal
     #
     # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
@@ -1570,7 +1570,7 @@ async def test_emoticons_as_literal(cursor: pyodbc.Cursor):
     assert result == v
 
 
-async def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
+async def _test_tvp(cursor: aiodbc.Cursor, diff_schema):
     # Test table value parameters (TVP).  I like the explanation here:
     #
     # https://www.mssqltips.com/sqlservertip/1483/using-table-valued-parameters-tvp-in-sql-server/
@@ -1584,9 +1584,9 @@ async def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
     # In this test we'll create a table, pass it to a stored procedure, and have the stored
     # procedure simply return the rows from the TVP.
     #
-    # Apparently the way pyodbc knows something is a TVP is because it is in a sequence.  I'm
+    # Apparently the way aiodbc knows something is a TVP is because it is in a sequence.  I'm
     # not sure I like that as it is very generic and specific to SQL Server.  It would be wiser
-    # to define a wrapper pyodbc.TVP or pyodbc.Table object, similar to the DB APIs `Binary`
+    # to define a wrapper aiodbc.TVP or aiodbc.Table object, similar to the DB APIs `Binary`
     # object.
 
     procname = 'SelectTVP'
@@ -1686,14 +1686,14 @@ async def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
     else:
         p1 = [params]
 
-    saved_native_uuid = pyodbc.native_uuid
+    saved_native_uuid = aiodbc.native_uuid
     try:
-        pyodbc.native_uuid = True
+        aiodbc.native_uuid = True
         result_array = [
             tuple(row)
             for row in await (await cursor.execute(f"exec {procname} ?", p1)).fetchall()]
     finally:
-        pyodbc.native_uuid = saved_native_uuid
+        aiodbc.native_uuid = saved_native_uuid
 
     # The values make it very difficult to troubleshoot if something is wrong, so instead of
     # asserting they are the same, we'll walk them if there is a problem to identify which is
@@ -1716,16 +1716,16 @@ async def _test_tvp(cursor: pyodbc.Cursor, diff_schema):
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-async def test_tvp(cursor: pyodbc.Cursor):
+async def test_tvp(cursor: aiodbc.Cursor):
     await _test_tvp(cursor, False)
 
 
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-async def test_tvp_diffschema(cursor: pyodbc.Cursor):
+async def test_tvp_diffschema(cursor: aiodbc.Cursor):
     await _test_tvp(cursor, True)
 
 
-async def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
+async def _test_scanning_all_tvp_rows(cursor: aiodbc.Cursor, data):
     # Make sure we check all the rows of the TVP before binding.
     # Splitting into multiple tests to prevent one failure from
     # masking other problems.
@@ -1733,11 +1733,11 @@ async def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
     typename = "TestTVPForScanning"
     try:
         await cursor.execute(f"DROP PROCEDURE {procname}")
-    except pyodbc.ProgrammingError:
+    except aiodbc.ProgrammingError:
         pass
     try:
         await cursor.execute(f"DROP TYPE {typename}")
-    except pyodbc.ProgrammingError:
+    except aiodbc.ProgrammingError:
         pass
     await cursor.execute(f"CREATE TYPE {typename} AS TABLE(val DECIMAL(20,4))")
     await cursor.execute(f"""\
@@ -1760,21 +1760,21 @@ async def _test_scanning_all_tvp_rows(cursor: pyodbc.Cursor, data):
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-async def test_tvp_decimal_mixed_precision(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_precision(cursor: aiodbc.Cursor):
     """Test for https://github.com/mkleehammer/pyodbc/issues/996."""
     await _test_scanning_all_tvp_rows(cursor, [[Decimal("4.0000")], [Decimal("25.000")]])
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-async def test_tvp_decimal_mixed_scale(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_scale(cursor: aiodbc.Cursor):
     """Test the different number decimal digits, but same number of integer digits."""
     await _test_scanning_all_tvp_rows(cursor, [[Decimal("4.000")], [Decimal("4.0000")]])
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason='FreeTDS does not support TVP')
-async def test_tvp_decimal_mixed_shape(cursor: pyodbc.Cursor):
+async def test_tvp_decimal_mixed_shape(cursor: aiodbc.Cursor):
     """Test same number of digits, shifting decimal point.
 
     See the lengthy comment in the code for BindTVPColumns().
@@ -1783,7 +1783,7 @@ async def test_tvp_decimal_mixed_shape(cursor: pyodbc.Cursor):
     await _test_scanning_all_tvp_rows(cursor, [[Decimal("40.000")], [Decimal("4.0000")]])
 
 
-async def _test_tvp_with_nulls_cleanup(cursor: pyodbc.Cursor, procname: str, typename: str):
+async def _test_tvp_with_nulls_cleanup(cursor: aiodbc.Cursor, procname: str, typename: str):
     """Leave the forest as pristine as you found it."""
 
     await cursor.execute(f"""\
@@ -1798,7 +1798,7 @@ async def _test_tvp_with_nulls_cleanup(cursor: pyodbc.Cursor, procname: str, typ
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2008, reason="TVP not supported until 2008")
 @pytest.mark.skipif(IS_FREETDS, reason="FreeTDS does not support TVP")
-async def test_tvp_with_nulls(cursor: pyodbc.Cursor):
+async def test_tvp_with_nulls(cursor: aiodbc.Cursor):
     """Make sure NULL values in a TVP don't crash the interpreter."""
 
     # Start with a clean slate.
@@ -1831,7 +1831,7 @@ async def test_tvp_with_nulls(cursor: pyodbc.Cursor):
 
 
 @pytest.mark.skipif(SQLSERVER_YEAR < 2000, reason='sql_variant not supported until 2000')
-async def test_sql_variant(cursor: pyodbc.Cursor):
+async def test_sql_variant(cursor: aiodbc.Cursor):
     """
     Tests decoding of the sql_variant data type as performed by the GetData_SqlVariant() method.
     """
@@ -1839,7 +1839,7 @@ async def test_sql_variant(cursor: pyodbc.Cursor):
     await cursor.execute("create table t1 (a sql_variant)")
 
     # insert a number of values of disparate types. this is not exhaustive as not all
-    # types that can be contained within a sql_variant field are supported by pyodbc
+    # types that can be contained within a sql_variant field are supported by aiodbc
     await cursor.execute("insert into t1 values (456.7)")
     await cursor.execute("insert into t1 values ('a string')")
     await cursor.execute("insert into t1 values (CAST('2024-06-03' AS DATE))")
@@ -1850,13 +1850,13 @@ async def test_sql_variant(cursor: pyodbc.Cursor):
     )
 
     # Expected behavior depends on this flag being set.
-    saved_native_uuid = pyodbc.native_uuid
+    saved_native_uuid = aiodbc.native_uuid
     try:
-        pyodbc.native_uuid = True
+        aiodbc.native_uuid = True
         results = [record[0] for record in
                    await (await cursor.execute("select a from t1")).fetchall()]
     finally:
-        pyodbc.native_uuid = saved_native_uuid
+        aiodbc.native_uuid = saved_native_uuid
 
     # Ensure all of the fetched values have the expected types.
     for index, assertion_tuple in enumerate(
@@ -1876,7 +1876,7 @@ async def test_sql_variant(cursor: pyodbc.Cursor):
         assert results[index] == expected_value
 
 
-async def test_rows_as_dicts(cursor: pyodbc.Cursor):
+async def test_rows_as_dicts(cursor: aiodbc.Cursor):
     """Test enhancement for ticket #171"""
 
     # Create and populate a test table.
@@ -1887,7 +1887,7 @@ async def test_rows_as_dicts(cursor: pyodbc.Cursor):
     assert cursor.rows_as_dicts is False
     row = await (await cursor.execute("select * from t1")).fetchone()
     assert not isinstance(row, dict)
-    assert isinstance(row, pyodbc.Row)
+    assert isinstance(row, aiodbc.Row)
     assert isinstance(row[0], int)
     assert isinstance(row[1], str)
     assert len(row) == 2
@@ -1897,7 +1897,7 @@ async def test_rows_as_dicts(cursor: pyodbc.Cursor):
     # Test the dict option
     cursor.rows_as_dicts = True
     row = await (await cursor.execute("select * from t1")).fetchone()
-    assert not isinstance(row, pyodbc.Row)
+    assert not isinstance(row, aiodbc.Row)
     assert isinstance(row, dict)
     assert row == {"id": 42, "name": "Kathleen"}
     assert isinstance(row["id"], int)
@@ -1919,11 +1919,11 @@ async def test_rows_as_dicts(cursor: pyodbc.Cursor):
     assert row == {"name": "Kathleen"}
 
 
-async def test_handles(cursor: pyodbc.Cursor):
+async def test_handles(cursor: aiodbc.Cursor):
     """Test the exposed native ODBC handles"""
 
     conn = cursor.connection
-    for handle in (pyodbc.henv, conn.hdbc, cursor.hstmt):
+    for handle in (aiodbc.henv, conn.hdbc, cursor.hstmt):
         assert isinstance(handle, ctypes.c_void_p)
         with pytest.raises(TypeError):
             if handle > 42:
@@ -1937,7 +1937,7 @@ async def test_handles(cursor: pyodbc.Cursor):
     assert conn.hdbc is None
 
 
-async def get_sqlserver_version(cursor: pyodbc.Cursor):
+async def get_sqlserver_version(cursor: aiodbc.Cursor):
 
     """
     Returns the major version: 8-->2000, 9-->2005, 10-->2008
@@ -1983,13 +1983,13 @@ def _generate_str(length, encoding=None):
     return v
 
 
-async def test_set_string_attr(cursor: pyodbc.Cursor):
+async def test_set_string_attr(cursor: aiodbc.Cursor):
     """Confirm that set_attr() now accepts string values.
 
     See https://github.com/mkleehammer/pyodbc/issues/505
     """
     original_db = await (await cursor.execute("SELECT db_name()")).fetchval()
     assert original_db != "master"
-    await cursor.connection.set_attr(pyodbc.SQL_ATTR_CURRENT_CATALOG, "master")
+    await cursor.connection.set_attr(aiodbc.SQL_ATTR_CURRENT_CATALOG, "master")
     new_db = await (await cursor.execute("SELECT db_name()")).fetchval()
     assert new_db == "master"

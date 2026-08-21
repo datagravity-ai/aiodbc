@@ -2,7 +2,7 @@
 """Regenerate rust/constants.rs against the platform's ODBC headers.
 
 rust/constants.rs is the source of truth for WHICH module-level integer constants
-pyodbc exposes (the list originally came from the C++ implementation's MAKECONST
+aiodbc exposes (the list originally came from the C++ implementation's MAKECONST
 table).  This script re-reads the names from that file, re-evaluates each one
 against the platform's ODBC headers (sql.h / sqlext.h, plus utils/dbspecific.h for
 driver-specific values) by compiling a small C program, and rewrites the file - so
@@ -12,7 +12,7 @@ To ADD a constant, append a ("NAME", 0) row to rust/constants.rs and rerun.
 Requires a C compiler and the unixODBC development headers (unixodbc-dev).
 
 Names that are not defined by the headers on this platform are skipped.  Run on
-Linux with unixODBC, which is the set of values pyodbc has always shipped on
+Linux with unixODBC, which is the set of values aiodbc has always shipped on
 non-Windows platforms.
 """
 
@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 OUTPUT = REPO / 'rust' / 'constants.rs'
 
 HEADER = '''\
-// ODBC constants exposed as pyodbc module attributes.
+// ODBC constants exposed as aiodbc module attributes.
 //
 // GENERATED FILE - do not edit by hand.  Regenerate with:
 //     python utils/generate-odbc-constants.py

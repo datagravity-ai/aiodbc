@@ -21,19 +21,19 @@ fn succeeded(ret: SqlReturn) -> bool {
 
 /// Return the shared environment handle, allocating it on first call.
 ///
-/// Like the C++ implementation, the module-level `pyodbc.pooling` and
-/// `pyodbc.odbcversion` attributes are read at allocation time, which is why they
+/// Like the C++ implementation, the module-level `aiodbc.pooling` and
+/// `aiodbc.odbcversion` attributes are read at allocation time, which is why they
 /// must be set before the first connection (or drivers()/dataSources() call).
 pub fn get_env(py: Python<'_>) -> PyResult<HEnv> {
     let mut guard = HENV
         .lock()
-        .map_err(|_| PyRuntimeError::new_err("pyodbc environment lock poisoned"))?;
+        .map_err(|_| PyRuntimeError::new_err("aiodbc environment lock poisoned"))?;
 
     if let Some(h) = *guard {
         return Ok(h as HEnv);
     }
 
-    let module = PyModule::import(py, "pyodbc")?;
+    let module = PyModule::import(py, "aiodbc")?;
     let pooling: bool = module.getattr("pooling")?.extract().unwrap_or(false);
     let odbcversion: String = module
         .getattr("odbcversion")?
@@ -60,7 +60,7 @@ pub fn get_env(py: Python<'_>) -> PyResult<HEnv> {
     let ret = unsafe { odbc_sys::SQLAllocHandle(HandleType::Env, std::ptr::null_mut(), &mut henv) };
     if !succeeded(ret) {
         return Err(PyRuntimeError::new_err(
-            "Can't initialize module pyodbc.  SQLAllocEnv failed.",
+            "Can't initialize module aiodbc.  SQLAllocEnv failed.",
         ));
     }
 

@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDict, PySlice, PyTuple, PyType};
 
-#[pyclass(module = "pyodbc")]
+#[pyclass(module = "aiodbc")]
 pub struct Row {
     /// Column values, in select order.
     pub values: Vec<Py<PyAny>>,
