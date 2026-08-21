@@ -10,7 +10,10 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   build_and_test:
     name: Build and smoke-test the Rust core
-    runs-on: ubuntu-24.04
+    # 22.04 rather than 24.04: the pinned MySQL Connector/ODBC 8.0.22 build (the
+    # same one the C++ reference workflow installs) fails to dlopen on 24.04
+    # because its shared-library dependencies are no longer present there.
+    runs-on: ubuntu-22.04
 
     services:
       mssql2019:
