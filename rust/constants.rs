@@ -3,8 +3,8 @@
 // GENERATED FILE - do not edit by hand.  Regenerate with:
 //     python utils/generate-odbc-constants.py
 //
-// The list of names mirrors the MAKECONST table in src/pyodbcmodule.cpp; the
-// values come from the unixODBC headers (sql.h/sqlext.h) and src/dbspecific.h.
+// The list of names mirrors the C++ implementation's MAKECONST table; the
+// values come from the unixODBC headers (sql.h/sqlext.h) and utils/dbspecific.h.
 
 pub const CONSTANTS: &[(&str, i64)] = &[
     ("SQL_WMETADATA", -888),
