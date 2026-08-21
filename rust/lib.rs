@@ -6,9 +6,16 @@ use odbc_sys::{FetchOrientation, Handle, HandleType, SqlReturn};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+mod async_bridge;
+mod connection;
 mod constants;
+mod cursor;
 mod env;
 mod errors;
+mod getdata;
+mod params;
+mod row;
+mod worker;
 
 fn succeeded(ret: SqlReturn) -> bool {
     matches!(ret, SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO)
@@ -135,7 +142,13 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SQLWCHAR_SIZE", 2)?;
 
     errors::register(py, m)?;
+    async_bridge::register(m)?;
 
+    m.add_class::<connection::Connection>()?;
+    m.add_class::<cursor::Cursor>()?;
+    m.add_class::<row::Row>()?;
+
+    m.add_function(wrap_pyfunction!(connection::connect, m)?)?;
     m.add_function(wrap_pyfunction!(drivers, m)?)?;
     m.add_function(wrap_pyfunction!(data_sources, m)?)?;
 

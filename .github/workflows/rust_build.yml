@@ -79,6 +79,41 @@ jobs:
         print('smoke test passed')
         EOF
 
+    - name: Async SQLite round-trip
+      run: |
+        cd /tmp
+        python - <<'EOF'
+        import asyncio, tempfile
+        import pyodbc
+
+        async def main():
+            tmpdir = tempfile.mkdtemp()
+            async with pyodbc.connect(f'driver=SQLite3;database={tmpdir}/ci.db') as cnxn:
+                cursor = cnxn.cursor()
+                await cursor.execute('create table t1(n int, s varchar(20))')
+                await cursor.executemany(
+                    'insert into t1 values (?, ?)', [(i, f'row{i}') for i in range(5)])
+                rows = await (await cursor.execute('select n, s from t1 order by n')).fetchall()
+                assert [r.n for r in rows] == list(range(5))
+                assert rows[3].s == 'row3'
+                assert cursor.description[0][0] == 'n'
+                total = 0
+                async for row in await cursor.execute('select n from t1'):
+                    total += row[0]
+                assert total == 10
+                try:
+                    await cursor.execute('select * from nonexistent_table')
+                except pyodbc.Error as e:
+                    assert isinstance(e.args[0], str)
+                else:
+                    raise AssertionError('expected pyodbc.Error')
+            assert not cnxn.closed  # __aexit__ commits, does not close
+            await cnxn.close()
+            print('async round-trip passed')
+
+        asyncio.run(main())
+        EOF
+
     - name: Check generated constants are up to date
       run: |
         python utils/generate-odbc-constants.py
