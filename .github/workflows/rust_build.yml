@@ -1,8 +1,9 @@
 name: Rust core
 
-# Builds and smoke-tests the Rust implementation of pyodbc
-# (see docs/rust-asyncio-rewrite-plan.md).  As the port progresses, the pytest
-# suites move from the "Ubuntu build" workflow (C++ reference) into this one.
+# Fast checks for the Rust implementation of pyodbc: lint, build, import smoke
+# test, and the SQLite suite (the only backend that needs no server).  The full
+# database matrix (SQL Server, PostgreSQL, MySQL, across Python versions) runs in
+# the "Ubuntu build" workflow against the same maturin-built wheel.
 
 # include "workflow_dispatch" so this workflow can be run manually from the Actions portal
 on: [push, pull_request, workflow_dispatch]
@@ -10,38 +11,7 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   build_and_test:
     name: Build and smoke-test the Rust core
-    # 22.04 rather than 24.04: the pinned MySQL Connector/ODBC 8.0.22 build (the
-    # same one the C++ reference workflow installs) fails to dlopen on 24.04
-    # because its shared-library dependencies are no longer present there.
-    runs-on: ubuntu-22.04
-
-    services:
-      mssql2019:
-        image: mcr.microsoft.com/mssql/server:2019-latest
-        ports:
-        - 1402:1433
-        env:
-          ACCEPT_EULA: Y
-          SA_PASSWORD: StrongPassword2019
-
-      postgres:
-        image: postgres:13
-        env:
-          POSTGRES_DB: postgres_db
-          POSTGRES_USER: postgres_user
-          POSTGRES_PASSWORD: postgres_pwd
-        ports:
-        - 5432:5432
-        # needed because the postgres container does not provide a healthcheck
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
-
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: root
-        ports:
-        - 3306:3306
-        options: --health-cmd "mysqladmin ping -proot" --health-interval 10s --health-timeout 5s --health-retries 5
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4.3.0
@@ -60,51 +30,6 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y unixodbc-dev libsqliteodbc
-
-    - name: Install the ODBC driver for SQL Server
-      run: |
-        sudo ACCEPT_EULA=Y apt-get install --yes msodbcsql18
-
-    - name: Install the ODBC driver for PostgreSQL
-      run: |
-        sudo apt-get install --yes odbc-postgresql
-        sudo sed -i 's|Driver=psqlodbca.so|Driver=/usr/lib/x86_64-linux-gnu/odbc/psqlodbca.so|g' /etc/odbcinst.ini
-        sudo sed -i 's|Driver=psqlodbcw.so|Driver=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so|g' /etc/odbcinst.ini
-        sudo sed -i 's|Setup=libodbcpsqlS.so|Setup=/usr/lib/x86_64-linux-gnu/odbc/libodbcpsqlS.so|g' /etc/odbcinst.ini
-
-    - name: Install the ODBC driver for MySQL
-      env:
-        MYSQL_DRIVER: mysql-connector-odbc-8.0.22-linux-glibc2.12-x86-64bit
-      run: |
-        cd "$RUNNER_TEMP"
-        curl --silent --show-error -O "https://www.mirrorservice.org/sites/ftp.mysql.com/Downloads/Connector-ODBC/8.0/${MYSQL_DRIVER}.tar.gz"
-        tar -xz -f "${MYSQL_DRIVER}.tar.gz"
-        sudo cp -v "${MYSQL_DRIVER}/lib/libmyodbc8a.so" /usr/lib/x86_64-linux-gnu/odbc/
-        sudo chmod a+r /usr/lib/x86_64-linux-gnu/odbc/libmyodbc8a.so
-        echo '[MySQL ODBC 8.0 ANSI Driver]' > mysql_odbcinst.ini
-        echo 'Driver     = /usr/lib/x86_64-linux-gnu/odbc/libmyodbc8a.so' >> mysql_odbcinst.ini
-        echo 'UsageCount = 1' >> mysql_odbcinst.ini
-        echo 'Threading  = 2' >> mysql_odbcinst.ini
-        sudo odbcinst -i -d -f mysql_odbcinst.ini
-
-    - name: Create the test database in SQL Server
-      run: |
-        docker exec -i "${{ job.services.mssql2019.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2019' -C -Q "SELECT @@VERSION" || sleep 5
-        docker exec -i "${{ job.services.mssql2019.id }}" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'StrongPassword2019' -C -Q "CREATE DATABASE test"
-
-    - name: Create the test database in PostgreSQL
-      env:
-        PGHOST: localhost
-        PGPORT: "5432"
-        PGDATABASE: postgres_db
-        PGUSER: postgres_user
-        PGPASSWORD: postgres_pwd
-      run: |
-        psql -c "CREATE DATABASE test WITH encoding='UTF8' LC_COLLATE='en_US.utf8' LC_CTYPE='en_US.utf8'"
-
-    - name: Create the test database in MySQL
-      run: |
-        mysql --host=127.0.0.1 --user=root --password=root --execute "CREATE DATABASE test"
 
     - name: Lint
       run: |
@@ -194,24 +119,6 @@ jobs:
       run: |
         pip install -r requirements-dev.txt
         python -m pytest tests/sqlite_test.py --no-header -q
-
-    - name: Run the SQL Server test suite
-      env:
-        PYODBC_SQLSERVER: "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1402;UID=sa;PWD=StrongPassword2019;DATABASE=test;Encrypt=Optional"
-      run: |
-        python -m pytest tests/sqlserver_test.py --no-header -q
-
-    - name: Run the PostgreSQL test suite
-      env:
-        PYODBC_POSTGRESQL: "DRIVER={PostgreSQL Unicode};SERVER=localhost;PORT=5432;UID=postgres_user;PWD=postgres_pwd;DATABASE=test"
-      run: |
-        python -m pytest tests/postgresql_test.py --no-header -q
-
-    - name: Run the MySQL test suite
-      env:
-        PYODBC_MYSQL: "DRIVER={MySQL ODBC 8.0 ANSI Driver};SERVER=localhost;UID=root;PWD=root;DATABASE=test;CHARSET=utf8mb4"
-      run: |
-        python -m pytest tests/mysql_test.py --no-header -q
 
     - name: Check generated constants are up to date
       run: |
