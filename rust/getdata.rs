@@ -42,6 +42,34 @@ pub const SQL_WVARCHAR: i16 = -9;
 pub const SQL_WLONGVARCHAR: i16 = -10;
 pub const SQL_GUID: i16 = -11;
 pub const SQL_SS_XML: i16 = -152;
+pub const SQL_SS_VARIANT: i16 = -150;
+pub const SQL_SS_TIME2: i16 = -154;
+const SQL_CA_SS_VARIANT_TYPE: u16 = 1215;
+
+// SQLColAttributeW with a raw field id (SQL_CA_SS_VARIANT_TYPE is driver-specific
+// and not in odbc-sys's Desc enum).
+extern "system" {
+    #[link_name = "SQLColAttributeW"]
+    fn RawSQLColAttributeW(
+        hstmt: HStmt,
+        column_number: u16,
+        field_identifier: u16,
+        character_attribute: Pointer,
+        buffer_length: i16,
+        string_length: *mut i16,
+        numeric_attribute: *mut Len,
+    ) -> SqlReturn;
+}
+
+/// SQL_SS_TIME2_STRUCT (dbspecific.h).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SsTime2 {
+    hour: u16,
+    minute: u16,
+    second: u16,
+    fraction: u32,
+}
 
 fn is_wide_type(sql_type: i16) -> bool {
     matches!(
@@ -67,6 +95,7 @@ pub enum CellValue {
     Null,
     Bool(bool),
     I64(i64),
+    U64(u64),
     F64(f64),
     Text(DecodedText),
     Bytes(Vec<u8>),
@@ -112,6 +141,7 @@ impl CellValue {
             CellValue::Null => py.None(),
             CellValue::Bool(v) => v.into_pyobject(py)?.to_owned().into_any().unbind(),
             CellValue::I64(v) => v.into_pyobject(py)?.into_any().unbind(),
+            CellValue::U64(v) => v.into_pyobject(py)?.into_any().unbind(),
             CellValue::F64(v) => v.into_pyobject(py)?.into_any().unbind(),
             CellValue::Text(t) => t.into_py(py)?,
             CellValue::Bytes(v) => PyBytes::new(py, &v).into_any().unbind(),
@@ -413,11 +443,77 @@ pub fn get_data(
         }
 
         SQL_TINYINT | SQL_SMALLINT | SQL_INTEGER | SQL_BIGINT => {
-            let mut value: i64 = 0;
-            match get_fixed(hstmt, col, CDataType::SBigInt, &mut value, 8, on_error)? {
-                false => Ok(CellValue::Null),
-                true => Ok(CellValue::I64(value)),
+            if info.is_unsigned {
+                let mut value: u64 = 0;
+                match get_fixed(hstmt, col, CDataType::UBigInt, &mut value, 8, on_error)? {
+                    false => Ok(CellValue::Null),
+                    true => Ok(CellValue::U64(value)),
+                }
+            } else {
+                let mut value: i64 = 0;
+                match get_fixed(hstmt, col, CDataType::SBigInt, &mut value, 8, on_error)? {
+                    false => Ok(CellValue::Null),
+                    true => Ok(CellValue::I64(value)),
+                }
             }
+        }
+
+        SQL_SS_TIME2 => {
+            // SQL Server 2008+ time columns (GetSqlServerTime in getdata.cpp).
+            let mut value = SsTime2::default();
+            let size = std::mem::size_of::<SsTime2>();
+            match get_fixed(hstmt, col, CDataType::Binary, &mut value, size, on_error)? {
+                false => Ok(CellValue::Null),
+                true => Ok(CellValue::Time {
+                    hour: value.hour as u8,
+                    minute: value.minute as u8,
+                    second: value.second as u8,
+                    micro: value.fraction / 1000,
+                }),
+            }
+        }
+
+        SQL_SS_VARIANT => {
+            // Read the variant header (0-length read), then ask the driver for the
+            // underlying type and dispatch again (GetData_SqlVariant).
+            let mut header: u8 = 0;
+            let mut indicator: Len = 0;
+            let ret = unsafe {
+                odbc_sys::SQLGetData(
+                    hstmt,
+                    (col + 1) as u16,
+                    CDataType::Binary,
+                    &mut header as *mut u8 as Pointer,
+                    0,
+                    &mut indicator,
+                )
+            };
+            if !succeeded(ret) {
+                return Err(on_error("SQLGetData"));
+            }
+            if indicator == odbc_sys::NULL_DATA {
+                return Ok(CellValue::Null);
+            }
+            let mut variant_type: Len = 0;
+            let ret = unsafe {
+                RawSQLColAttributeW(
+                    hstmt,
+                    (col + 1) as u16,
+                    SQL_CA_SS_VARIANT_TYPE,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut variant_type,
+                )
+            };
+            if !succeeded(ret) {
+                return Err(on_error("SQLColAttribute"));
+            }
+            let inner = ColInfo {
+                sql_type: variant_type as i16,
+                ..info.clone()
+            };
+            get_data(hstmt, col, &inner, ctx, on_error)
         }
 
         SQL_REAL | SQL_FLOAT | SQL_DOUBLE => {
@@ -536,7 +632,7 @@ pub fn python_type_for_sql_type(
         SQL_REAL | SQL_FLOAT | SQL_DOUBLE => PyFloat::type_object(py).into_any(),
         SQL_SMALLINT | SQL_INTEGER | SQL_TINYINT | SQL_BIGINT => PyInt::type_object(py).into_any(),
         SQL_DATE | SQL_TYPE_DATE => py.import("datetime")?.getattr("date")?,
-        SQL_TIME | SQL_TYPE_TIME => py.import("datetime")?.getattr("time")?,
+        SQL_TIME | SQL_TYPE_TIME | SQL_SS_TIME2 => py.import("datetime")?.getattr("time")?,
         SQL_TIMESTAMP | SQL_TYPE_TIMESTAMP => py.import("datetime")?.getattr("datetime")?,
         SQL_BIT => PyBool::type_object(py).into_any(),
         _ => PyByteArray::type_object(py).into_any(),
