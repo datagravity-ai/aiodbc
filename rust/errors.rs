@@ -6,16 +6,16 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
-create_exception!(pyodbc, Warning, PyException);
-create_exception!(pyodbc, Error, PyException);
-create_exception!(pyodbc, InterfaceError, Error);
-create_exception!(pyodbc, DatabaseError, Error);
-create_exception!(pyodbc, DataError, DatabaseError);
-create_exception!(pyodbc, OperationalError, DatabaseError);
-create_exception!(pyodbc, IntegrityError, DatabaseError);
-create_exception!(pyodbc, InternalError, DatabaseError);
-create_exception!(pyodbc, ProgrammingError, DatabaseError);
-create_exception!(pyodbc, NotSupportedError, DatabaseError);
+create_exception!(aiodbc, Warning, PyException);
+create_exception!(aiodbc, Error, PyException);
+create_exception!(aiodbc, InterfaceError, Error);
+create_exception!(aiodbc, DatabaseError, Error);
+create_exception!(aiodbc, DataError, DatabaseError);
+create_exception!(aiodbc, OperationalError, DatabaseError);
+create_exception!(aiodbc, IntegrityError, DatabaseError);
+create_exception!(aiodbc, InternalError, DatabaseError);
+create_exception!(aiodbc, ProgrammingError, DatabaseError);
+create_exception!(aiodbc, NotSupportedError, DatabaseError);
 
 pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("Warning", py.get_type::<Warning>())?;

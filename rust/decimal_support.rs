@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 // The locale's decimal separator, initialized by the Python layer from
-// locale.localeconv() at import (see python/pyodbc/__init__.py).
+// locale.localeconv() at import (see python/aiodbc/__init__.py).
 static DECIMAL_SEPARATOR: Mutex<Option<String>> = Mutex::new(None);
 
 #[pyfunction]

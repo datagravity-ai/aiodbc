@@ -1,6 +1,6 @@
 name: Rust core
 
-# Fast checks for the Rust implementation of pyodbc: lint, build, import smoke
+# Fast checks for the Rust implementation of aiodbc: lint, build, import smoke
 # test, and the SQLite suite (the only backend that needs no server).  The full
 # database matrix (SQL Server, PostgreSQL, MySQL, across Python versions) runs in
 # the "Ubuntu build" workflow against the same maturin-built wheel.
@@ -46,32 +46,32 @@ jobs:
       run: |
         cd /tmp   # keep the repo's python/ source tree off the import path
         python - <<'EOF'
-        import pyodbc
+        import aiodbc
 
-        print('version:', pyodbc.version)
-        assert pyodbc.apilevel == '2.0'
-        assert pyodbc.paramstyle == 'qmark'
+        print('version:', aiodbc.version)
+        assert aiodbc.apilevel == '2.0'
+        assert aiodbc.paramstyle == 'qmark'
 
         # constants come from the generated table
-        assert pyodbc.SQL_VARCHAR == 12
-        assert pyodbc.SQL_WMETADATA == -888
-        assert pyodbc.SQLWCHAR_SIZE == 2
+        assert aiodbc.SQL_VARCHAR == 12
+        assert aiodbc.SQL_WMETADATA == -888
+        assert aiodbc.SQLWCHAR_SIZE == 2
 
         # DB API exception hierarchy
-        assert issubclass(pyodbc.OperationalError, pyodbc.DatabaseError)
-        assert issubclass(pyodbc.DatabaseError, pyodbc.Error)
-        assert not issubclass(pyodbc.Warning, pyodbc.Error)
+        assert issubclass(aiodbc.OperationalError, aiodbc.DatabaseError)
+        assert issubclass(aiodbc.DatabaseError, aiodbc.Error)
+        assert not issubclass(aiodbc.Warning, aiodbc.Error)
 
-        drivers = pyodbc.drivers()
+        drivers = aiodbc.drivers()
         print('drivers:', drivers)
         assert isinstance(drivers, list)
         assert any('SQLite' in d for d in drivers)
 
-        sources = pyodbc.dataSources()
+        sources = aiodbc.dataSources()
         print('dataSources:', sources)
         assert isinstance(sources, dict)
         try:
-            pyodbc.dataSources(scope='bogus')
+            aiodbc.dataSources(scope='bogus')
         except ValueError:
             pass
         else:
@@ -85,11 +85,11 @@ jobs:
         cd /tmp
         python - <<'EOF'
         import asyncio, tempfile
-        import pyodbc
+        import aiodbc
 
         async def main():
             tmpdir = tempfile.mkdtemp()
-            async with pyodbc.connect(f'driver=SQLite3;database={tmpdir}/ci.db') as cnxn:
+            async with aiodbc.connect(f'driver=SQLite3;database={tmpdir}/ci.db') as cnxn:
                 cursor = cnxn.cursor()
                 await cursor.execute('create table t1(n int, s varchar(20))')
                 await cursor.executemany(
@@ -104,10 +104,10 @@ jobs:
                 assert total == 10
                 try:
                     await cursor.execute('select * from nonexistent_table')
-                except pyodbc.Error as e:
+                except aiodbc.Error as e:
                     assert isinstance(e.args[0], str)
                 else:
-                    raise AssertionError('expected pyodbc.Error')
+                    raise AssertionError('expected aiodbc.Error')
             assert not cnxn.closed  # __aexit__ commits, does not close
             await cnxn.close()
             print('async round-trip passed')

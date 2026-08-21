@@ -1,5 +1,5 @@
 [project]
-name = "pyodbc"
+name = "aiodbc"
 version = "6.0.0a1"
 
 requires-python = ">=3.10"
@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 #
 # https://cibuildwheel.readthedocs.io/en/stable/options/#requires-python
 
-description = "DB API module for ODBC"
+description = "asyncio-native DB API module for ODBC"
 readme = "README.md"
 license = "MIT-0"
 
@@ -30,7 +30,7 @@ classifiers=['Development Status :: 5 - Production/Stable',
              ]
 
 [project.urls]
-Homepage = "https://github.com/mkleehammer/pyodbc"
+Homepage = "https://github.com/erickpeirson/pyodbc"
 
 [tool.pytest.ini_options]
 # The test suites are async (see docs/rust-asyncio-rewrite-plan.md); auto mode lets
@@ -41,8 +41,8 @@ asyncio_mode = "auto"
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
-# The Rust core (rust/ + Cargo.toml) is the compiled module; python/pyodbc/ is the
+# The Rust core (rust/ + Cargo.toml) is the compiled module; python/aiodbc/ is the
 # pure-Python package layered on top of it.
 [tool.maturin]
 python-source = "python"
-module-name = "pyodbc._core"
+module-name = "aiodbc._core"

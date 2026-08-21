@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "aiodbc"
+version = "6.0.0-a1"
+dependencies = [
+ "odbc-sys",
+ "pyo3",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,14 +132,6 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "pyodbc"
-version = "6.0.0-a1"
-dependencies = [
- "odbc-sys",
- "pyo3",
 ]
 
 [[package]]

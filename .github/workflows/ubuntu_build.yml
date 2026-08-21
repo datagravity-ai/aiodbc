@@ -211,7 +211,7 @@ jobs:
         name: test_wheel__${{ github.sha }}
         path: dist
 
-    - name: Install pyodbc and the test dependencies
+    - name: Install aiodbc and the test dependencies
       # The abi3 wheel from the build_wheel job installs on every matrix version.
       run: |
         cd "$GITHUB_WORKSPACE"
@@ -223,8 +223,8 @@ jobs:
         if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
         echo "*** pip freeze"
         python -m pip freeze --all
-        echo "*** pyodbc version"
-        cd /tmp && python -c "import pyodbc; print(pyodbc.version)"
+        echo "*** aiodbc version"
+        cd /tmp && python -c "import aiodbc; print(aiodbc.version)"
 
     - name: Run PostgreSQL tests
       env:

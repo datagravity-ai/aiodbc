@@ -1,5 +1,5 @@
 [package]
-name = "pyodbc"
+name = "aiodbc"
 # The canonical version is in pyproject.toml (see CLAUDE.md); maturin uses that
 # for wheel metadata.  This one is not surfaced anywhere.
 version = "6.0.0-a1"

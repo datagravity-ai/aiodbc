@@ -1,6 +1,6 @@
-// The pyodbc._core extension module: the Rust replacement for the C++ sources in
+// The aiodbc._core extension module: the Rust core of the package
 // src/, being ported per docs/rust-asyncio-rewrite-plan.md.  The public package is
-// assembled in python/pyodbc/__init__.py.
+// assembled in python/aiodbc/__init__.py.
 
 use odbc_sys::{FetchOrientation, Handle, HandleType, SqlReturn};
 use pyo3::prelude::*;
@@ -25,9 +25,9 @@ fn succeeded(ret: SqlReturn) -> bool {
 }
 
 /// The shared ODBC environment handle, allocating it on first use.  The Python
-/// layer exposes it as pyodbc.henv (a ctypes.c_void_p).
+/// layer exposes it as aiodbc.henv (a ctypes.c_void_p).
 #[pyfunction]
-#[pyo3(name = "_henv")] // underscored so `from pyodbc._core import *` skips it
+#[pyo3(name = "_henv")] // underscored so `from aiodbc._core import *` skips it
 fn henv(py: Python<'_>) -> PyResult<usize> {
     Ok(env::get_env(py)? as usize)
 }
@@ -148,7 +148,7 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(*name, *value)?;
     }
 
-    // pyodbc always treats SQLWCHAR data as 16-bit, even where the driver manager
+    // aiodbc always treats SQLWCHAR data as 16-bit, even where the driver manager
     // defines SQLWCHAR as 32-bit wchar_t (see HACKING.md).
     m.add("SQLWCHAR_SIZE", 2)?;
 

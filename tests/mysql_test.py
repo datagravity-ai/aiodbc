@@ -10,31 +10,31 @@ from datetime import date, datetime
 from functools import lru_cache
 from typing import Iterator
 
-import pyodbc, pytest
+import aiodbc, pytest
 
 
 CNXNSTR = os.environ.get('PYODBC_MYSQL', 'DSN=mysql;charset=utf8mb4')
 
 
 async def connect(autocommit=False, attrs_before=None):
-    c = await pyodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
+    c = await aiodbc.connect(CNXNSTR, autocommit=autocommit, attrs_before=attrs_before)
 
     # As of libmyodbc5w 5.3 SQLGetTypeInfo returns absurdly small sizes
     # leading to slow writes.  Override them:
     c.maxwrite = 1024 * 1024 * 1024
 
     # My MySQL configuration (and I think the default) sends *everything*
-    # in UTF-8.  The pyodbc default is to send Unicode as UTF-16 and to
+    # in UTF-8.  The aiodbc default is to send Unicode as UTF-16 and to
     # decode WCHAR via UTF-16.  Change them both to UTF-8.
-    c.setdecoding(pyodbc.SQL_CHAR, encoding='utf-8')
-    c.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+    c.setdecoding(aiodbc.SQL_CHAR, encoding='utf-8')
+    c.setdecoding(aiodbc.SQL_WCHAR, encoding='utf-8')
     c.setencoding(encoding='utf-8')
 
     return c
 
 
 @pytest.fixture()
-async def cursor() -> Iterator[pyodbc.Cursor]:
+async def cursor() -> Iterator[aiodbc.Cursor]:
     cnxn = await connect()
 
     cur = cnxn.cursor()
@@ -51,19 +51,19 @@ async def cursor() -> Iterator[pyodbc.Cursor]:
         await cnxn.close()
 
 
-async def test_text(cursor: pyodbc.Cursor):
+async def test_text(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'text')
 
 
-async def test_varchar(cursor: pyodbc.Cursor):
+async def test_varchar(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'varchar')
 
 
-async def test_varbinary(cursor: pyodbc.Cursor):
+async def test_varbinary(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'varbinary')
 
 
-async def test_blob(cursor: pyodbc.Cursor):
+async def test_blob(cursor: aiodbc.Cursor):
     await _test_vartype(cursor, 'blob')
 
 
@@ -84,7 +84,7 @@ async def _test_vartype(cursor, datatype):
             assert v == value
 
 
-async def test_char(cursor: pyodbc.Cursor):
+async def test_char(cursor: aiodbc.Cursor):
     value = "testing"
     await cursor.execute("create table t1(s char(7))")
     await cursor.execute("insert into t1 values(?)", "testing")
@@ -92,20 +92,20 @@ async def test_char(cursor: pyodbc.Cursor):
     assert v == value
 
 
-async def test_int(cursor: pyodbc.Cursor):
+async def test_int(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'int', [None, -1, 0, 1, 12345678])
 
 
-async def test_bigint(cursor: pyodbc.Cursor):
+async def test_bigint(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'bigint', [None, -1, 0, 1, 0x123456789, 0x7FFFFFFF,
                                           0xFFFFFFFF, 0x123456789])
 
 
-async def test_float(cursor: pyodbc.Cursor):
+async def test_float(cursor: aiodbc.Cursor):
     await _test_scalar(cursor, 'float', [None, -1, 0, 1, 1234.5, -200])
 
 
-async def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
+async def _test_scalar(cursor: aiodbc.Cursor, datatype, values):
     await cursor.execute(f"create table t1(c1 {datatype})")
     for value in values:
         await cursor.execute("delete from t1")
@@ -114,7 +114,7 @@ async def _test_scalar(cursor: pyodbc.Cursor, datatype, values):
         assert v == value
 
 
-async def test_decimal(cursor: pyodbc.Cursor):
+async def test_decimal(cursor: aiodbc.Cursor):
     tests = [
         ('100010', '19'),  # The ODBC docs tell us how the bytes should look in the C struct
         ('1000.10', '20,6'),
@@ -132,7 +132,7 @@ async def test_decimal(cursor: pyodbc.Cursor):
             assert v == value
 
 
-async def test_multiple_bindings(cursor: pyodbc.Cursor):
+async def test_multiple_bindings(cursor: aiodbc.Cursor):
     "More than one bind and select on a cursor"
     await cursor.execute("create table t1(n int)")
     await cursor.execute("insert into t1 values (?)", 1)
@@ -143,7 +143,7 @@ async def test_multiple_bindings(cursor: pyodbc.Cursor):
         await cursor.execute("select n from t1 where n < 3")
 
 
-async def test_different_bindings(cursor: pyodbc.Cursor):
+async def test_different_bindings(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(n int)")
     await cursor.execute("create table t2(d datetime)")
     await cursor.execute("insert into t1 values (?)", 1)
@@ -151,40 +151,40 @@ async def test_different_bindings(cursor: pyodbc.Cursor):
 
 
 def test_drivers():
-    p = pyodbc.drivers()
+    p = aiodbc.drivers()
     assert isinstance(p, list)
 
 
 def test_datasources():
-    p = pyodbc.dataSources()
+    p = aiodbc.dataSources()
     assert isinstance(p, dict)
 
 
 async def test_getinfo_string():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_CATALOG_NAME_SEPARATOR)
+    value = await cnxn.getinfo(aiodbc.SQL_CATALOG_NAME_SEPARATOR)
     assert isinstance(value, str)
 
 
 async def test_getinfo_bool():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_ACCESSIBLE_TABLES)
+    value = await cnxn.getinfo(aiodbc.SQL_ACCESSIBLE_TABLES)
     assert isinstance(value, bool)
 
 
 async def test_getinfo_int():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_DEFAULT_TXN_ISOLATION)
+    value = await cnxn.getinfo(aiodbc.SQL_DEFAULT_TXN_ISOLATION)
     assert isinstance(value, int)
 
 
 async def test_getinfo_smallint():
     cnxn = await connect()
-    value = await cnxn.getinfo(pyodbc.SQL_CONCAT_NULL_BEHAVIOR)
+    value = await cnxn.getinfo(aiodbc.SQL_CONCAT_NULL_BEHAVIOR)
     assert isinstance(value, int)
 
 
-async def test_subquery_params(cursor: pyodbc.Cursor):
+async def test_subquery_params(cursor: aiodbc.Cursor):
     """Ensure parameter markers work in a subquery"""
     await cursor.execute("create table t1(id integer, s varchar(20))")
     await cursor.execute("insert into t1 values (?,?)", 1, 'test')
@@ -215,11 +215,11 @@ async def test_close_cnxn():
 
     # Now that the connection is closed, we expect an exception.  (If the code attempts to use
     # the HSTMT, we'll get an access violation instead.)
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(aiodbc.ProgrammingError):
         await cursor.execute("select * from t1")
 
 
-async def test_negative_row_index(cursor: pyodbc.Cursor):
+async def test_negative_row_index(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(s varchar(20))")
     await cursor.execute("insert into t1 values(?)", "1")
     row = await (await cursor.execute("select * from t1")).fetchone()
@@ -228,10 +228,10 @@ async def test_negative_row_index(cursor: pyodbc.Cursor):
 
 
 def test_version():
-    assert 3 == len(pyodbc.version.split('.'))  # 1.3.1 etc.
+    assert 3 == len(aiodbc.version.split('.'))  # 1.3.1 etc.
 
 
-async def test_date(cursor: pyodbc.Cursor):
+async def test_date(cursor: aiodbc.Cursor):
     value = date(2001, 1, 1)
 
     await cursor.execute("create table t1(dt date)")
@@ -242,7 +242,7 @@ async def test_date(cursor: pyodbc.Cursor):
     assert result == value
 
 
-async def test_time(cursor: pyodbc.Cursor):
+async def test_time(cursor: aiodbc.Cursor):
     value = datetime.now().time()
 
     # We aren't yet writing values using the new extended time type so the value written to the
@@ -256,7 +256,7 @@ async def test_time(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_datetime(cursor: pyodbc.Cursor):
+async def test_datetime(cursor: aiodbc.Cursor):
     value = datetime(2007, 1, 15, 3, 4, 5)
 
     await cursor.execute("create table t1(dt datetime)")
@@ -266,7 +266,7 @@ async def test_datetime(cursor: pyodbc.Cursor):
     assert value == result
 
 
-async def test_rowcount_delete(cursor: pyodbc.Cursor):
+async def test_rowcount_delete(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(i int)")
     count = 4
     for i in range(count):
@@ -275,7 +275,7 @@ async def test_rowcount_delete(cursor: pyodbc.Cursor):
     assert cursor.rowcount == count
 
 
-async def test_rowcount_nodata(cursor: pyodbc.Cursor):
+async def test_rowcount_nodata(cursor: aiodbc.Cursor):
     """
     This represents a different code path than a delete that deleted something.
 
@@ -289,11 +289,11 @@ async def test_rowcount_nodata(cursor: pyodbc.Cursor):
     assert cursor.rowcount == 0
 
 
-async def test_rowcount_select(cursor: pyodbc.Cursor):
+async def test_rowcount_select(cursor: aiodbc.Cursor):
     """
     Ensure Cursor.rowcount is set properly after a select statement.
 
-    pyodbc calls SQLRowCount after each execute and sets Cursor.rowcount.  Databases can return
+    aiodbc calls SQLRowCount after each execute and sets Cursor.rowcount.  Databases can return
     the actual rowcount or they can return -1 if it would help performance.  MySQL seems to
     always return the correct rowcount.
     """
@@ -309,7 +309,7 @@ async def test_rowcount_select(cursor: pyodbc.Cursor):
     assert cursor.rowcount == count
 
 
-async def test_rowcount_reset(cursor: pyodbc.Cursor):
+async def test_rowcount_reset(cursor: aiodbc.Cursor):
     "Ensure rowcount is reset to -1"
 
     # The Python DB API says that rowcount should be set to -1 and most ODBC drivers let us
@@ -328,11 +328,11 @@ async def test_rowcount_reset(cursor: pyodbc.Cursor):
 
 
 async def test_lower_case():
-    "Ensure pyodbc.lowercase forces returned column names to lowercase."
+    "Ensure aiodbc.lowercase forces returned column names to lowercase."
 
     # Has to be set before creating the cursor
     cnxn = await connect()
-    pyodbc.lowercase = True
+    aiodbc.lowercase = True
     cursor = cnxn.cursor()
 
     await cursor.execute("drop table if exists t1")
@@ -346,10 +346,10 @@ async def test_lower_case():
     assert names == ["abc", "def"]
 
     # Put it back so other tests don't fail.
-    pyodbc.lowercase = False
+    aiodbc.lowercase = False
 
 
-async def test_row_description(cursor: pyodbc.Cursor):
+async def test_row_description(cursor: aiodbc.Cursor):
     """
     Ensure Cursor.description is accessible as Row.cursor_description.
     """
@@ -359,7 +359,7 @@ async def test_row_description(cursor: pyodbc.Cursor):
     assert cursor.description == row.cursor_description
 
 
-async def test_table_privileges(cursor: pyodbc.Cursor):
+async def test_table_privileges(cursor: aiodbc.Cursor):
     # Confirm exposure of SQLTablePrivileges.  We're limited in what we can test, as
     # we can't control whether we're running with permission to create users or grant
     # permissions.  We can at least verify that the method generates a results set
@@ -372,7 +372,7 @@ async def test_table_privileges(cursor: pyodbc.Cursor):
     assert cols == names, "unexpected column names for privileges results set"
 
 
-async def test_executemany(cursor: pyodbc.Cursor):
+async def test_executemany(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b varchar(10))")
 
     params = [(i, str(i)) for i in range(1, 6)]
@@ -391,7 +391,7 @@ async def test_executemany(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-async def test_executemany_one(cursor: pyodbc.Cursor):
+async def test_executemany_one(cursor: aiodbc.Cursor):
     "Pass executemany a single sequence"
     await cursor.execute("create table t1(a int, b varchar(10))")
 
@@ -411,7 +411,7 @@ async def test_executemany_one(cursor: pyodbc.Cursor):
         assert param[1] == row[1]
 
 
-async def test_row_slicing(cursor: pyodbc.Cursor):
+async def test_row_slicing(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b int, c int, d int)")
     await cursor.execute("insert into t1 values(1,2,3,4)")
 
@@ -427,7 +427,7 @@ async def test_row_slicing(cursor: pyodbc.Cursor):
     assert result is row
 
 
-async def test_row_repr(cursor: pyodbc.Cursor):
+async def test_row_repr(cursor: aiodbc.Cursor):
     await cursor.execute("create table t1(a int, b int, c int, d int)")
     await cursor.execute("insert into t1 values(1,2,3,4)")
 
@@ -443,10 +443,10 @@ async def test_row_repr(cursor: pyodbc.Cursor):
     assert result == "(1,)"
 
 
-async def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
+async def test_emoticons_as_parameter(cursor: aiodbc.Cursor):
     # https://github.com/mkleehammer/pyodbc/issues/423
     #
-    # When sending a varchar parameter, pyodbc is supposed to set ColumnSize to the number
+    # When sending a varchar parameter, aiodbc is supposed to set ColumnSize to the number
     # of characters.  Ensure it works even with 4-byte characters.
     #
     # http://www.fileformat.info/info/unicode/char/1f31c/index.htm
@@ -461,7 +461,7 @@ async def test_emoticons_as_parameter(cursor: pyodbc.Cursor):
     assert result == v
 
 
-async def test_emoticons_as_literal(cursor: pyodbc.Cursor):
+async def test_emoticons_as_literal(cursor: aiodbc.Cursor):
     # https://github.com/mkleehammer/pyodbc/issues/630
 
     v = "x \U0001F31C z"
@@ -510,11 +510,11 @@ def _generate_str(length, encoding=None):
     return v
 
 
-async def test_handles(cursor: pyodbc.Cursor):
+async def test_handles(cursor: aiodbc.Cursor):
     """Test the exposed native ODBC handles"""
 
     conn = cursor.connection
-    for handle in (pyodbc.henv, conn.hdbc, cursor.hstmt):
+    for handle in (aiodbc.henv, conn.hdbc, cursor.hstmt):
         assert isinstance(handle, ctypes.c_void_p)
         with pytest.raises(TypeError):
             if handle > 42:

@@ -143,7 +143,7 @@ fn extract_impl(
     }
     // The BinaryNull sentinel distinguishes binary NULLs from char NULLs when the
     // driver cannot describe parameters (GetNullBinaryInfo in params.cpp).
-    if let Ok(bn) = py.import("pyodbc").and_then(|m| m.getattr("BinaryNull")) {
+    if let Ok(bn) = py.import("aiodbc").and_then(|m| m.getattr("BinaryNull")) {
         if cell.is(&bn) {
             return Ok(ParamValue::NullBinary);
         }

@@ -61,7 +61,7 @@ const SQL_DESCRIBE_PARAMETER: u16 = 10002;
 
 pub type ConverterMap = Arc<Mutex<HashMap<i32, Py<PyAny>>>>;
 
-#[pyclass(module = "pyodbc")]
+#[pyclass(module = "aiodbc")]
 pub struct Connection {
     tx: Option<Sender<Task>>,
     closed: bool,
@@ -923,7 +923,7 @@ fn encode_connection_string(connstring: &str, encoding: Option<&str>) -> PyResul
 }
 
 /// Open a connection and return an asyncio future resolving to it.  The public
-/// pyodbc.connect() wrapper builds the connection string and keyword handling on
+/// aiodbc.connect() wrapper builds the connection string and keyword handling on
 /// top of this.
 #[pyfunction]
 #[pyo3(signature = (connstring, *, autocommit=false, readonly=false, timeout=0, encoding=None, driver_completion=0, attrs_before=None))]

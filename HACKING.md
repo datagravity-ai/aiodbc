@@ -1,8 +1,8 @@
-# Hacking on pyodbc
+# Hacking on aiodbc
 
-pyodbc 6.x is implemented in Rust with an asyncio-native API.  The compiled core
+aiodbc 6.x is implemented in Rust with an asyncio-native API.  The compiled core
 lives in rust/ (built by Cargo.toml + maturin into the extension module
-`pyodbc._core`); the public package is assembled in python/pyodbc/.  The design and
+`aiodbc._core`); the public package is assembled in python/aiodbc/.  The design and
 the history of the rewrite from C++ are in docs/rust-asyncio-rewrite-plan.md.
 
 ## Development loop

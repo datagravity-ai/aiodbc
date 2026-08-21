@@ -1,5 +1,5 @@
-# Type stubs for pyodbc._core, the compiled Rust extension module.  The public
-# package interface is assembled by pyodbc/__init__.py on top of these names.
+# Type stubs for aiodbc._core, the compiled Rust extension module.  The public
+# package interface is assembled by aiodbc/__init__.py on top of these names.
 #
 # ignore line spacing (E303), mixed case names (N802/N803)
 # ruff: noqa: E303, N802, N803
@@ -83,7 +83,7 @@ SQL_GUID: int
 SQL_NO_NULLS: int
 SQL_NULLABLE: int
 SQL_NULLABLE_UNKNOWN: int
-# specific to pyodbc
+# specific to aiodbc
 SQL_WMETADATA: int
 
 # SQL_CONVERT_X
@@ -303,7 +303,7 @@ SQL_DRIVER_COMPLETE_REQUIRED: int
 SQL_DRIVER_NOPROMPT: int
 SQL_DRIVER_PROMPT: int
 
-# pyodbc-specific constants
+# aiodbc-specific constants
 BinaryNull: Any  # to distinguish binary NULL values from char NULL values
 SQLWCHAR_SIZE: int
 
@@ -328,7 +328,7 @@ class Connection:
     futures completed from that thread.
     https://www.python.org/dev/peps/pep-0249/#connection-objects
 
-    Not instantiated directly: call pyodbc.connect() and await the result (or use
+    Not instantiated directly: call aiodbc.connect() and await the result (or use
     it as an async context manager).  Connection objects cannot be pickled.
     """
 
@@ -406,7 +406,7 @@ class Connection:
     def timeout(self, value: int) -> None: ...
 
     # async context manager: commits on clean exit, rolls back on error, and (like
-    # the synchronous pyodbc Connection) does NOT close the connection
+    # the synchronous aiodbc Connection) does NOT close the connection
     async def __aenter__(self) -> Connection: ...
     async def __aexit__(self, exc_type, exc_value, traceback) -> bool: ...
 
@@ -420,8 +420,8 @@ class Connection:
 
         Args:
             encoding: Text encoding codec, e.g. "utf-8".
-            ctype: The C data type when passing data - either pyodbc.SQL_CHAR or
-                pyodbc.SQL_WCHAR.
+            ctype: The C data type when passing data - either aiodbc.SQL_CHAR or
+                aiodbc.SQL_WCHAR.
         """
         ...
 
@@ -432,10 +432,10 @@ class Connection:
         """Set the text decoding used when reading SQL_CHAR or SQL_WCHAR data.
 
         Args:
-            sqltype: pyodbc.SQL_CHAR, pyodbc.SQL_WCHAR, or pyodbc.SQL_WMETADATA.
+            sqltype: aiodbc.SQL_CHAR, aiodbc.SQL_WCHAR, or aiodbc.SQL_WMETADATA.
             encoding: Text encoding codec, e.g. "utf-8".
             ctype: The C data type to request from SQLGetData - either
-                pyodbc.SQL_CHAR or pyodbc.SQL_WCHAR.
+                aiodbc.SQL_CHAR or aiodbc.SQL_WCHAR.
         """
         ...
 
@@ -583,7 +583,7 @@ class Cursor:
         ...
 
     def fetchval(self) -> Awaitable[Any]:
-        """Resolve to the first column of the first row, or None (pyodbc
+        """Resolve to the first column of the first row, or None (aiodbc
         extension)."""
         ...
 
@@ -733,7 +733,7 @@ def connect(connstring: str,
             driver_completion: int = 0,
             attrs_before: dict | None = None) -> Awaitable[Connection]:
     """Open a connection (the connection string is already fully assembled).
-    Application code should call pyodbc.connect(), which builds the connection
+    Application code should call aiodbc.connect(), which builds the connection
     string from keyword arguments and wraps this."""
     ...
 
@@ -747,5 +747,5 @@ def get_decimal_separator() -> str:
 
 def _henv() -> int:
     """The shared ODBC environment handle, allocated on first use (internal;
-    pyodbc.henv wraps it in ctypes.c_void_p)."""
+    aiodbc.henv wraps it in ctypes.c_void_p)."""
     ...

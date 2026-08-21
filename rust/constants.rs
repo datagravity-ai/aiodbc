@@ -1,4 +1,4 @@
-// ODBC constants exposed as pyodbc module attributes.
+// ODBC constants exposed as aiodbc module attributes.
 //
 // GENERATED FILE - do not edit by hand.  Regenerate with:
 //     python utils/generate-odbc-constants.py

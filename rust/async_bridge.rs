@@ -77,7 +77,7 @@ impl FutureHandle {
     pub fn complete(self, py: Python<'_>, result: PyResult<Py<PyAny>>) {
         let helper = COMPLETE_HELPER
             .get()
-            .expect("pyodbc._core not initialized")
+            .expect("aiodbc._core not initialized")
             .bind(py);
         let (error, value) = match result {
             Ok(v) => (py.None(), v),
